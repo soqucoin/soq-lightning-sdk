@@ -1,0 +1,15 @@
+title = "Soqucoin secret-gate (soq-lightning-sdk)"
+[extend]
+useDefault = true
+[[rules]]
+id = "soq-signer-bearer"
+description = "soq-signer hot-wallet bearer token"
+regex = '''soqsigner-[A-Za-z0-9-]*bearer[A-Za-z0-9-]*'''
+[[rules]]
+id = "rpc-provider-key"
+description = "RPC provider API key"
+regex = '''(?i)(helius|alchemy|infura|quicknode)[a-z0-9_.-]*["'=: ]+[a-f0-9]{8}-?[a-f0-9]{4}-?[a-f0-9]{4,}'''
+[allowlist]
+description = "tests, docs, templates"
+paths = ['''(^|/)test/''','''(^|/)tests/''','''\.example$''','''(^|/)docs?/''']
+regexes = ['''(?i)change_me''','''(?i)placeholder''','''(?i)your[_-]?(password|api[_-]?key|token|secret)''','''<[^>]*>''','''\$\{?[A-Za-z_]''','''process\.env''','''(?i)\b(example|test|dummy)\b''']

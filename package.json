@@ -1,0 +1,30 @@
+{
+  "name": "soq-lightning-sdk",
+  "version": "0.1.0-alpha.0",
+  "description": "Soqucoin eLTOO Lightning SDK — quantum-safe (ML-DSA-44), instant payments on stagenet",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "soq-ln": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "canary": "npm run build && node dist/canary.js"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.4.0",
+    "@noble/post-quantum": "^0.6.1",
+    "bech32": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^5.4.0"
+  }
+}

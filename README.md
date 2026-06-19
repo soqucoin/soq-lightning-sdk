@@ -43,6 +43,32 @@ console.log(await ln.channel(ch.channel_id)); // balances shifted, state_index b
 await ln.close(ch.channel_id);                // cooperative close, L1 settlement
 ```
 
+## In the browser (zero install)
+
+This SDK is pure TypeScript and the ML-DSA-44 binding (`@noble/post-quantum`) is WASM-free pure JS, so the **entire crypto path runs client-side in the browser** — generate a Dilithium wallet, build and sign an invoice or transaction, all without a server ever touching a key. This is what powers the [Soqucoin builders playground](https://soqu.org/build): a quantum-safe wallet and a real signed transaction, in the browser, in about a minute.
+
+```ts
+import { mlDsaKeygen, nobleMlDsa, freshPreimage, signInvoice, encodeInvoice } from "soq-lightning-sdk";
+
+// Ephemeral, in-browser ML-DSA-44 wallet — no server, no custody.
+const { publicKey, secretKey } = mlDsaKeygen();
+
+const { paymentHash } = freshPreimage((n) => crypto.getRandomValues(new Uint8Array(n)));
+const invoice = signInvoice({ version: 1, amountSat: 250000000n, paymentHash,
+  destination, timestamp: BigInt(Math.floor(Date.now() / 1000)), expiry: 3600,
+  description: "", metadata: new Uint8Array() }, secretKey, nobleMlDsa);
+const encoded = encodeInvoice(invoice);   // soq1ln1…
+```
+
+> ML-DSA-44 signatures are 2,420 bytes and keys 1,312 bytes. The crypto is pure JS but not tiny — **lazy-load** it and run signing in a **web worker** so the UI doesn't jank. Keys generated in the browser are ephemeral and stagenet-only; they hold no real value.
+
+A runnable version of this flow (offline crypto, plus an optional live channel flow) is in [`examples/quickstart.mjs`](examples/quickstart.mjs):
+
+```bash
+npm run example:quickstart                       # offline, zero infra
+LSP_URL=https://<lsp> npm run example:quickstart # also runs open→pay→close
+```
+
 ## Invoices (PQ-native)
 
 ```ts
@@ -64,13 +90,18 @@ const trusted = verifyAgainstShort(fetchedInvoice, scannedUri, payeePubKey, mlDs
 
 ## Plugging in real eLTOO transactions
 
-`SoqLightning.pay()` delegates TX construction to an `UpdateTxBuilder`. The default is a placeholder accepted by the accept-and-store LSP on the happy path. When `channel.ts` ships, inject the real 0x42-signer:
+`SoqLightning.pay()` delegates TX construction to an `UpdateTxBuilder`. The default (`placeholderTxBuilder`) sends opaque placeholders that the accept-and-store LSP accepts on the happy path — enough to exercise open/pay/close end to end. For real, disputable bytes, inject `DilithiumEltooBuilder` (shipped in `channel.ts`), which builds the actual 0x42-signed eLTOO update/settlement TXs:
 
 ```ts
-const ln = new SoqLightning({ baseUrl, txBuilder: dilithiumEltooBuilder });
+import { SoqLightning, DilithiumEltooBuilder } from "soq-lightning-sdk";
+
+const ln = new SoqLightning({
+  baseUrl,
+  txBuilder: new DilithiumEltooBuilder({ /* funding, keys, mldsa ... */ }),
+});
 ```
 
-The API does not change. Only the bytes on the wire become disputable.
+The API does not change — only the bytes on the wire become disputable. Every serializer `DilithiumEltooBuilder` produces (APO 0x42/0x41, CTV hash, CSFS 2-of-2) is proven byte-identical to the node; see `test/vector.test.mjs`.
 
 ## CLI
 

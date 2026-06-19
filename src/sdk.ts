@@ -157,6 +157,11 @@ export class SoqLightning {
     }
   }
 
+  /** LSP liveness — `{ status: "ok", ... }` when the peer + its node backend are healthy. */
+  health(): Promise<any> { return this.client.health(); }
+  /** LSP identity/capabilities — peer name, version, network, fee policy, etc. */
+  info(): Promise<any> { return this.client.info(); }
+
   channel(id: string): Promise<Channel> { return this.client.getChannel(id); }
   channels(): Promise<{ channels: Channel[] }> { return this.client.listChannels(); }
 

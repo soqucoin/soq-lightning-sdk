@@ -18,3 +18,6 @@ export * from "./watchtower.js";
 export * from "./htlc.js";
 export * from "./mldsa.js";
 export * from "./noderpc.js";
+// Namespaced to avoid colliding with channel.ts (Tx/TxIn/TxOut/serializeTx/txid/SIGHASH_ALL):
+// playground imports `import { onchain } from "soq-lightning-sdk"`.
+export * as onchain from "./onchain.js";

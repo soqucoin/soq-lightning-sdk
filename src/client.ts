@@ -5,7 +5,7 @@
 // marked (confirmed) are read from rest.go, others are (verify) against the live API.
 
 export interface RestClientOpts {
-  baseUrl: string;                 // e.g. https://lightning.soqupool.com  (stagenet LSP)
+  baseUrl: string;                 // e.g. https://lsp.soqu.org  (stagenet LSP, valid TLS)
   fetchImpl?: typeof fetch;        // injectable for tests / non-browser
 }
 

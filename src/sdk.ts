@@ -68,14 +68,24 @@ export class SoqLightning {
     this.watchtower = opts.watchtower;
   }
 
-  /** Fund via faucet + auto-open a channel (stagenet path). Returns the opened channel. */
+  /** Fund via faucet + auto-open a channel (stagenet path). Returns the opened channel.
+   *  The LSP caps channel capacity at max_channel_sat; the faucet will drip the requested
+   *  funds but SILENTLY decline to open a channel if asked for more (it returns success+txid
+   *  with no channel_id — verified live 2026-06-24). We clamp the request to the advertised
+   *  cap so the open actually happens; the returned Channel reflects the real capacity. */
   async fundAndOpen(p: OpenChannelParams): Promise<Channel> {
+    const info: any = await this.client.info().catch(() => ({}));
+    const maxCap = Number(info?.max_channel_sat) || p.capacitySat;
+    const capacitySat = Math.min(p.capacitySat, maxCap);
     const r: FaucetResp = await this.client.faucetDrip({
       address: p.address, pub_key_hex: p.pubKeyHex, open_channel: true,
-      amount_sat: p.capacitySat, name: p.name ?? "sdk",
+      amount_sat: capacitySat, name: p.name ?? "sdk",
     });
     if (!r.success) throw new Error(`faucet failed: ${r.error ?? "unknown"}`);
-    if (!r.channel_id) throw new Error("faucet did not open a channel");
+    if (!r.channel_id)
+      throw new Error(
+        `faucet dripped ${r.amount_sat ?? capacitySat} sat (txid ${r.txid ?? "?"}) but did not open a ` +
+        `channel — requested capacity may exceed the LSP max_channel_sat (${maxCap})`);
     return this.client.getChannel(r.channel_id);
   }
 

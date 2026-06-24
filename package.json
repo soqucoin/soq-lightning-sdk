@@ -1,6 +1,6 @@
 {
   "name": "soq-lightning-sdk",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "Soqucoin eLTOO Lightning SDK: quantum-safe (ML-DSA-44) instant payments on stagenet",
   "license": "MIT",
   "type": "module",

@@ -53,6 +53,48 @@ test("SoqLightning fundAndOpen → pay → pay → close (accept-and-store peer)
   assert.ok(close.settlement_txid?.startsWith("settle_"));
 });
 
+// Capped peer reproducing the LIVE stagenet LSP (verified 2026-06-24): the faucet drips
+// the requested amount but only opens a channel when amount_sat <= max_channel_sat. Above
+// the cap it returns {success, txid} with NO channel_id and NO error — a silent decline.
+function cappedPeer(maxChannelSat) {
+  const chans = new Map();
+  let seq = 0;
+  const ok = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  return async (url, init) => {
+    const path = new URL(url).pathname;
+    const body = init?.body ? JSON.parse(init.body) : {};
+    if (path === "/v1/info") return ok({ network: "stagenet", echo_mode: false, max_channel_sat: maxChannelSat });
+    if (path === "/v1/faucet" && init?.method === "POST") {
+      if (body.amount_sat > maxChannelSat) return ok({ success: true, txid: "drip_no_chan", amount_sat: body.amount_sat });
+      const id = `ch_${++seq}`;
+      chans.set(id, { channel_id: id, initiator_pub_key_hex: body.pub_key_hex, peer_pub_key_hex: "peer",
+        capacity_sat: body.amount_sat, initiator_balance_sat: body.amount_sat, peer_balance_sat: 0,
+        state_index: 0, state: "open", csv_delay: 288, created_at_unix: 1718000000 });
+      return ok({ success: true, txid: "tx", amount_sat: body.amount_sat, channel_id: id });
+    }
+    const m = path.match(/^\/v1\/channels\/([^/]+)$/);
+    if (m) { const ch = chans.get(m[1]); return ch ? ok(ch) : new Response(JSON.stringify({ error: "not found" }), { status: 404 }); }
+    return new Response("{}", { status: 404 });
+  };
+}
+
+test("fundAndOpen clamps capacity to max_channel_sat so the faucet actually opens a channel", async () => {
+  const ln = new SoqLightning({ baseUrl: "https://mock", fetchImpl: cappedPeer(100_000_000) });
+  // Ask for 10 SOQ against a 1 SOQ cap — must NOT throw "did not open a channel".
+  const ch = await ln.fundAndOpen({ pubKeyHex: "aa", address: "soq1x", capacitySat: 1_000_000_000 });
+  assert.equal(ch.state, "open");
+  assert.equal(ch.capacity_sat, 100_000_000, "capacity clamped to the LSP cap");
+});
+
+test("fundAndOpen surfaces a descriptive error if the faucet drips but opens no channel", async () => {
+  // Cap of 0 forces the drip-without-channel path even after clamping (maxCap=0 -> falls back
+  // to requested, faucet still declines) to exercise the error message.
+  const peer = cappedPeer(0);
+  const ln = new SoqLightning({ baseUrl: "https://mock", fetchImpl: peer });
+  await assert.rejects(() => ln.fundAndOpen({ pubKeyHex: "aa", address: "soq1x", capacitySat: 1_000_000_000 }),
+    /did not open a channel/);
+});
+
 test("SoqLightning.pay rejects overspend locally (no wasted round-trip)", async () => {
   const ln = new SoqLightning({ baseUrl: "https://mock", fetchImpl: mockPeer() });
   const ch = await ln.fundAndOpen({ pubKeyHex: "aa", address: "soq1x", capacitySat: 500000000 });

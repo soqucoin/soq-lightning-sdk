@@ -88,11 +88,10 @@ export const scriptNum = (value: number | bigint): Uint8Array => {
   return pushData(Uint8Array.from(bytes));
 };
 
-/** eLTOO update output witness script (lightning_script_tests.cpp:298-308 / spec §2.2):
- *  IF  <stateNum+1> CLTV DROP  <A> CHECKSIGVERIFY <B> CHECKSIG   (supersession path)
- *  ELSE <csv> CSV DROP         <A> CHECKSIGVERIFY <B> CHECKSIG   (settlement path)
- *  ENDIF
- *  The IF-branch CLTV rises with state so a newer update supersedes older ones. */
+/** @deprecated SPEC-REFERENCE ONLY — never executed on V6 (no-op CHECKSIG/IF/CLTV + inline
+ *  1312-byte pubkeys > 520 push limit). Use {@link eltooUpdateScriptV6} (keyhash-2-of-2, executes
+ *  under SCRIPT_VERIFY_V6_CONTROLFLOW). Kept for the legacy witness/test surface only.
+ *  IF  <stateNum+1> CLTV DROP  <A> CHECKSIGVERIFY <B> CHECKSIG / ELSE <csv> CSV DROP ... ENDIF */
 export function eltooUpdateScript(stateNum: number, aPub: Uint8Array, bPub: Uint8Array, settlementCsv = 288): Uint8Array {
   return concat(
     u8(OP.IF),
@@ -361,11 +360,53 @@ export function dilithiumKeyhashScript(rawPubKey: Uint8Array): Uint8Array {
  *  pubB's keyhash is committed FIRST because the first opcode checks the TOP eval
  *  item, and the witness puts pubB on top (see dilithiumKeyhash2of2Witness). */
 export function dilithiumKeyhash2of2Script(pubA: Uint8Array, pubB: Uint8Array): Uint8Array {
+  return dilithiumKeyhash2of2ScriptFromHashes(dilithiumKeyHash(pubA), dilithiumKeyHash(pubB));
+}
+
+/** Key-committed 2-of-2 body from raw 32-byte keyhashes: `<khB> OP_CDKH <khA> OP_CDKH OP_1`. */
+export function dilithiumKeyhash2of2ScriptFromHashes(khA: Uint8Array, khB: Uint8Array): Uint8Array {
+  if (khA.length !== 32 || khB.length !== 32) throw new Error("keyhash must be 32 bytes");
   return concat(
-    pushData(dilithiumKeyHash(pubB)), u8(OP.CHECKDILITHIUMKEYHASH),
-    pushData(dilithiumKeyHash(pubA)), u8(OP.CHECKDILITHIUMKEYHASH),
+    pushData(khB), u8(OP.CHECKDILITHIUMKEYHASH),
+    pushData(khA), u8(OP.CHECKDILITHIUMKEYHASH),
     u8(OP.ONE),
   );
+}
+
+/** B1 eLTOO update output witnessScript (DL-V6-CONTROLFLOW-RESTORE §4.1):
+ *    IF  <stateNum+1> CLTV DROP  <khBupdate> CDKH <khAupdate> CDKH OP_1   (supersession, APO-0x42)
+ *    ELSE <csv> CSV DROP         <khBsettle> CDKH <khAsettle> CDKH OP_1   (settlement after CSV)
+ *    ENDIF
+ *  The CLTV ratchet + CSV delay EXECUTE on V6 once SCRIPT_VERIFY_V6_CONTROLFLOW is active. REPLACES
+ *  the old eltooUpdateScript (IF/CLTV/CHECKSIG inline-pubkey form, which never executed on V6:
+ *  no-op opcodes + 1312-byte pubkeys > 520 push limit). Settlement keyhashes default to update.
+ *  Node-pinned: lightning_script_tests.cpp/b1_script_vectors. */
+export function eltooUpdateScriptV6FromKeyhashes(
+  stateNum: number, khAupdate: Uint8Array, khBupdate: Uint8Array,
+  opts: { khAsettle?: Uint8Array; khBsettle?: Uint8Array; settlementCsv?: number } = {},
+): Uint8Array {
+  const csv = opts.settlementCsv ?? 288;
+  return concat(
+    u8(OP.IF),
+      scriptNum(stateNum + 1), u8(OP.CLTV), u8(OP.DROP),
+      dilithiumKeyhash2of2ScriptFromHashes(khAupdate, khBupdate),
+    u8(OP.ELSE),
+      scriptNum(csv), u8(OP.CSV), u8(OP.DROP),
+      dilithiumKeyhash2of2ScriptFromHashes(opts.khAsettle ?? khAupdate, opts.khBsettle ?? khBupdate),
+    u8(OP.ENDIF),
+  );
+}
+
+/** [eltooUpdateScriptV6FromKeyhashes] taking raw 1312-byte ML-DSA pubkeys (hashed internally). */
+export function eltooUpdateScriptV6(
+  stateNum: number, updateA: Uint8Array, updateB: Uint8Array,
+  opts: { settleA?: Uint8Array; settleB?: Uint8Array; settlementCsv?: number } = {},
+): Uint8Array {
+  return eltooUpdateScriptV6FromKeyhashes(stateNum, dilithiumKeyHash(updateA), dilithiumKeyHash(updateB), {
+    khAsettle: opts.settleA ? dilithiumKeyHash(opts.settleA) : undefined,
+    khBsettle: opts.settleB ? dilithiumKeyHash(opts.settleB) : undefined,
+    settlementCsv: opts.settlementCsv,
+  });
 }
 
 /** v6 witness for a single-key committed spend. Eval items: [sig, pub] (pub on top).
@@ -593,7 +634,7 @@ export class DilithiumEltooBuilder implements UpdateTxBuilder {
 
   buildUpdateTx(stateNum: number): Tx {
     const csv = this.o.settlementCsv ?? 288;
-    const witnessScript = eltooUpdateScript(stateNum, this.o.initiatorPub, this.o.peerPub, csv);
+    const witnessScript = eltooUpdateScriptV6(stateNum, this.o.initiatorPub, this.o.peerPub, { settlementCsv: csv });
     return {
       version: 2,
       locktime: stateNum + 1, // satisfies the prior script's IF-branch CLTV <stateNum+1>

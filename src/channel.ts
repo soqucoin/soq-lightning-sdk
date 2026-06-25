@@ -409,6 +409,30 @@ export function eltooUpdateScriptV6(
   });
 }
 
+// ── B1 branch witnesses (step 4) ──
+// Node-accepted v6 satisfaction layouts for spending the B1 eLTOO output (lightning_script_tests
+// eltoo_v6_ratchet_target): the 2-of-2 keyhash satisfaction + the OP_IF selector (0x01 = IF
+// update, empty = ELSE settlement), then witnessScript + trailing 0x00-prefixed pubkey.
+
+/** B1 eLTOO UPDATE-branch (supersession, IF) witness: [sigA, pubA, sigB, pubB, TRUE]. sigA/pubA
+ *  commit to khAupdate, sigB/pubB to khBupdate (B is checked first → on top). The spending
+ *  next-state update tx sets nLockTime ≥ stateNum+1 so its CLTV ratchet passes. */
+export function eltooUpdateBranchWitness(
+  eltooScript: Uint8Array, sigA: Uint8Array, pubA: Uint8Array, sigB: Uint8Array, pubB: Uint8Array,
+  trailingPubKey: Uint8Array,
+): Uint8Array[] {
+  return p2wshV6Witness([sigA, pubA, sigB, pubB, Uint8Array.of(0x01)], eltooScript, trailingPubKey);
+}
+
+/** B1 eLTOO SETTLEMENT-branch (close, ELSE) witness: same 2-of-2 satisfaction with a FALSE
+ *  (empty) selector. The settlement tx must spend with nSequence ≥ settlementCsv (the CSV delay). */
+export function eltooSettlementBranchWitness(
+  eltooScript: Uint8Array, sigA: Uint8Array, pubA: Uint8Array, sigB: Uint8Array, pubB: Uint8Array,
+  trailingPubKey: Uint8Array,
+): Uint8Array[] {
+  return p2wshV6Witness([sigA, pubA, sigB, pubB, new Uint8Array(0)], eltooScript, trailingPubKey);
+}
+
 /** v6 witness for a single-key committed spend. Eval items: [sig, pub] (pub on top).
  *  `sig` = signForKeyhash(...); `rawPubKey` = raw 1312-byte key; `trailingPubKey` is
  *  0x00-prefixed (use dilithiumWitnessPubKey). */

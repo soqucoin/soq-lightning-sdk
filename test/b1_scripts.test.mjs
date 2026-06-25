@@ -13,6 +13,11 @@ import {
   htlcScriptV6FromKeyhashes,
   htlcScriptV6,
   dilithiumKeyHash,
+  dilithiumWitnessPubKey,
+  eltooUpdateBranchWitness,
+  eltooSettlementBranchWitness,
+  htlcSuccessWitnessV6,
+  htlcTimeoutWitnessV6,
 } from "../dist/index.js";
 
 const fill = (b) => new Uint8Array(32).fill(b);
@@ -34,6 +39,34 @@ test("B1 HTLC script byte-matches the node vector", () => {
     hex(ws),
     "63a820abababababababababababababababababababababababababababababababab88205555555555555555555555555555555555555555555555555555555555555555b6516702f401b175206666666666666666666666666666666666666666666666666666666666666666b65168",
   );
+});
+
+test("B1 branch witnesses match the node-accepted satisfaction layout", () => {
+  const sigA = new Uint8Array(2421).fill(0x01);
+  const pubA = new Uint8Array(1312).fill(0xa1);
+  const sigB = new Uint8Array(2421).fill(0x02);
+  const pubB = new Uint8Array(1312).fill(0xb2);
+  const script = Uint8Array.of(0x63, 0x68);
+  const trailing = dilithiumWitnessPubKey(pubA); // 0x00 ‖ pubA
+
+  const up = eltooUpdateBranchWitness(script, sigA, pubA, sigB, pubB, trailing);
+  assert.equal(up.length, 7);
+  assert.deepEqual(up[4], Uint8Array.of(0x01)); // truthy IF selector
+  assert.deepEqual(up[5], script);
+  assert.equal(up[6][0], 0x00); // trailing 0x00-prefixed
+
+  const set = eltooSettlementBranchWitness(script, sigA, pubA, sigB, pubB, trailing);
+  assert.equal(set[4].length, 0); // empty → ELSE
+
+  const preimage = new Uint8Array(32).fill(0x07);
+  const ok = htlcSuccessWitnessV6(script, sigA, pubA, preimage, trailing);
+  assert.equal(ok.length, 6);
+  assert.deepEqual(ok[2], preimage);
+  assert.deepEqual(ok[3], Uint8Array.of(0x01));
+
+  const to = htlcTimeoutWitnessV6(script, sigA, pubA, trailing);
+  assert.equal(to.length, 5);
+  assert.equal(to[2].length, 0);
 });
 
 test("pubkey wrappers agree with the from-keyhash form", () => {

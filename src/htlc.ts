@@ -71,6 +71,26 @@ export function htlcScriptV6(paymentHash: Uint8Array, payeePub: Uint8Array, paye
   return htlcScriptV6FromKeyhashes(paymentHash, dilithiumKeyHash(payeePub), dilithiumKeyHash(payerPub), cltvExpiry);
 }
 
+// ── B1 HTLC witnesses (step 4) ── node-accepted layouts (lightning_script_tests htlc_v6_target).
+
+/** B1 HTLC SUCCESS (IF) witness: [sigPayee, pubPayee, preimage, TRUE] + script + trailer.
+ *  [preimage] must SHA256 to the committed paymentHash; [trailingPubKey] is 0x00-prefixed. */
+export function htlcSuccessWitnessV6(
+  htlcWitnessScript: Uint8Array, sigPayee: Uint8Array, pubPayee: Uint8Array, preimage: Uint8Array,
+  trailingPubKey: Uint8Array,
+): Uint8Array[] {
+  if (preimage.length !== 32) throw new Error("preimage must be 32 bytes");
+  return p2wshV6Witness([sigPayee, pubPayee, preimage, Uint8Array.of(0x01)], htlcWitnessScript, trailingPubKey);
+}
+
+/** B1 HTLC TIMEOUT (ELSE) witness: [sigPayer, pubPayer, FALSE] + script + trailer. The claim tx
+ *  must set nLockTime ≥ cltvExpiry with a non-final input so the CLTV passes. */
+export function htlcTimeoutWitnessV6(
+  htlcWitnessScript: Uint8Array, sigPayer: Uint8Array, pubPayer: Uint8Array, trailingPubKey: Uint8Array,
+): Uint8Array[] {
+  return p2wshV6Witness([sigPayer, pubPayer, new Uint8Array(0)], htlcWitnessScript, trailingPubKey);
+}
+
 // ---- §2.2 HTLC output script (legacy spec-reference) ----
 /** @deprecated SPEC-REFERENCE ONLY — never executed on V6 (no-op CHECKSIG/IF/CLTV + inline
  *  1312-byte pubkeys > 520 push limit). Use {@link htlcScriptV6}. Kept for the legacy

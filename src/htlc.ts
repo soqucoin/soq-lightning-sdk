@@ -16,7 +16,7 @@
 // pure + offline-tested and ready to wire when those land.
 
 import {
-  OP, pushData, scriptNum, p2wshV6, p2wshV6Witness, signAllWitness, type Tx,
+  OP, pushData, scriptNum, p2wshV6, p2wshV6Witness, signAllWitness, dilithiumKeyHash, type Tx,
 } from "./channel.js";
 import { verifyInvoice, type Invoice, type MlDsa } from "./invoice.js";
 
@@ -43,10 +43,59 @@ export const FORWARD_ERR = {
   downstreamFail: 0x40, // fail backward on downstream failure/timeout
 } as const;
 
-// ---- §2.2 HTLC output script ----
-/** OP_IF  OP_SHA256 <H> OP_EQUALVERIFY <payeePub> OP_CHECKSIG   (SUCCESS: reveal P + sign)
- *  OP_ELSE <cltv_expiry> OP_CLTV OP_DROP <payerPub> OP_CHECKSIG (TIMEOUT: absolute CLTV)
- *  OP_ENDIF.  All CHECKSIGs use plain SIGHASH_ALL (§2.2 note). */
+// ---- B1 HTLC output script (DL-V6-CONTROLFLOW-RESTORE §4.2) ----
+/** IF  OP_SHA256 <paymentHash> OP_EQUALVERIFY <khPayee> CDKH OP_1   (SUCCESS: preimage + payee sig)
+ *  ELSE <cltvExpiry> CLTV DROP <khPayer> CDKH OP_1                  (TIMEOUT: absolute CLTV + payer)
+ *  ENDIF.  Executes on V6 under SCRIPT_VERIFY_V6_CONTROLFLOW (hashlock + CLTV + keyhash sigs).
+ *  Node-pinned: lightning_script_tests.cpp/b1_script_vectors. */
+export function htlcScriptV6FromKeyhashes(
+  paymentHash: Uint8Array, khPayee: Uint8Array, khPayer: Uint8Array, cltvExpiry: number,
+): Uint8Array {
+  if (paymentHash.length !== 32) throw new Error("paymentHash must be 32 bytes");
+  if (khPayee.length !== 32 || khPayer.length !== 32) throw new Error("keyhash must be 32 bytes");
+  const c = (...xs: Uint8Array[]) => { const n = xs.reduce((s, x) => s + x.length, 0); const o = new Uint8Array(n); let p = 0; for (const x of xs) { o.set(x, p); p += x.length; } return o; };
+  const b = (n: number) => Uint8Array.of(n);
+  return c(
+    b(OP.IF),
+      b(OP.SHA256), pushData(paymentHash), b(OP.EQUALVERIFY),
+      pushData(khPayee), b(OP.CHECKDILITHIUMKEYHASH), b(OP.ONE),
+    b(OP.ELSE),
+      scriptNum(cltvExpiry), b(OP.CLTV), b(OP.DROP),
+      pushData(khPayer), b(OP.CHECKDILITHIUMKEYHASH), b(OP.ONE),
+    b(OP.ENDIF),
+  );
+}
+
+/** [htlcScriptV6FromKeyhashes] taking raw 1312-byte ML-DSA pubkeys (hashed internally). */
+export function htlcScriptV6(paymentHash: Uint8Array, payeePub: Uint8Array, payerPub: Uint8Array, cltvExpiry: number): Uint8Array {
+  return htlcScriptV6FromKeyhashes(paymentHash, dilithiumKeyHash(payeePub), dilithiumKeyHash(payerPub), cltvExpiry);
+}
+
+// ── B1 HTLC witnesses (step 4) ── node-accepted layouts (lightning_script_tests htlc_v6_target).
+
+/** B1 HTLC SUCCESS (IF) witness: [sigPayee, pubPayee, preimage, TRUE] + script + trailer.
+ *  [preimage] must SHA256 to the committed paymentHash; [trailingPubKey] is 0x00-prefixed. */
+export function htlcSuccessWitnessV6(
+  htlcWitnessScript: Uint8Array, sigPayee: Uint8Array, pubPayee: Uint8Array, preimage: Uint8Array,
+  trailingPubKey: Uint8Array,
+): Uint8Array[] {
+  if (preimage.length !== 32) throw new Error("preimage must be 32 bytes");
+  return p2wshV6Witness([sigPayee, pubPayee, preimage, Uint8Array.of(0x01)], htlcWitnessScript, trailingPubKey);
+}
+
+/** B1 HTLC TIMEOUT (ELSE) witness: [sigPayer, pubPayer, FALSE] + script + trailer. The claim tx
+ *  must set nLockTime ≥ cltvExpiry with a non-final input so the CLTV passes. */
+export function htlcTimeoutWitnessV6(
+  htlcWitnessScript: Uint8Array, sigPayer: Uint8Array, pubPayer: Uint8Array, trailingPubKey: Uint8Array,
+): Uint8Array[] {
+  return p2wshV6Witness([sigPayer, pubPayer, new Uint8Array(0)], htlcWitnessScript, trailingPubKey);
+}
+
+// ---- §2.2 HTLC output script (legacy spec-reference) ----
+/** @deprecated SPEC-REFERENCE ONLY — never executed on V6 (no-op CHECKSIG/IF/CLTV + inline
+ *  1312-byte pubkeys > 520 push limit). Use {@link htlcScriptV6}. Kept for the legacy
+ *  witness/test surface only.
+ *  OP_IF  OP_SHA256 <H> OP_EQUALVERIFY <payeePub> OP_CHECKSIG / ELSE <cltv> CLTV DROP <payerPub> CHECKSIG ENDIF */
 export function htlcScript(paymentHash: Uint8Array, payeePub: Uint8Array, payerPub: Uint8Array, cltvExpiry: number): Uint8Array {
   if (paymentHash.length !== 32) throw new Error("paymentHash must be 32 bytes");
   const c = (...xs: Uint8Array[]) => { const n = xs.reduce((s, x) => s + x.length, 0); const o = new Uint8Array(n); let p = 0; for (const x of xs) { o.set(x, p); p += x.length; } return o; };

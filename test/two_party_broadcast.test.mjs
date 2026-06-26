@@ -1,0 +1,100 @@
+// Copyright (c) 2026 Soqucoin Labs Inc.
+// Distributed under the MIT software license.
+//
+// two_party_broadcast.test.mjs — the two-SEPARATE-signer path (spec §J open #3).
+//
+// The b1-canary fused both keys (one signKeyhashFunding2of2 call held skA AND skB). This
+// proves the real trust boundary: the user and the LSP each hold ONLY their own key, each
+// produces a partial in isolation, and the orchestrator combines them into a broadcastable
+// tx — across the full lifecycle (open → supersede → settle → coop close). Offline (no node);
+// the live broadcast is src/two-party-canary.ts (Buddy runs it with creds).
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  EltooBroadcaster, LocalParty, TwoPartyChannel, localTwoPartyChannel,
+  apoSighash, p2wshV6, SIGHASH_ANYPREVOUTANYSCRIPT,
+  nobleMlDsa, mlDsaKeygen,
+} from "../dist/index.js";
+
+const USER = mlDsaKeygen(new Uint8Array(32).fill(0xa1)); // the user (initiator, key A)
+const LSP = mlDsaKeygen(new Uint8Array(32).fill(0xb2));  // the LSP (peer, key B)
+const MAL = mlDsaKeygen(new Uint8Array(32).fill(0xcc));  // a wrong key
+
+const CAP = 1_000_000_000n;
+const FEE = 10_000_000n;
+const STATE = 100;
+const CSV = 6;
+
+const params = {
+  funding: { txid: new Uint8Array(32).fill(0xfd), n: 0 }, capacitySat: CAP,
+  initiatorPub: USER.publicKey, peerPub: LSP.publicKey,
+  initiatorScriptPubKey: p2wshV6(Uint8Array.of(0x51)),
+  peerScriptPubKey: p2wshV6(Uint8Array.of(0x51, 0x51)),
+  settlementCsv: CSV, feeSat: FEE,
+};
+
+test("each party signs in isolation (own key only) and both partials verify", async () => {
+  const bc = new EltooBroadcaster(params);
+  const user = new LocalParty(bc, USER.secretKey, USER.publicKey, nobleMlDsa);
+  const lsp = new LocalParty(bc, LSP.secretKey, LSP.publicKey, nobleMlDsa);
+
+  const tx = bc.buildFundingUpdateTx(STATE);
+  const up = await user.signFunding(tx);
+  const lp = await lsp.signFunding(tx);
+
+  // Each partial carries that party's own pubkey — neither party touched the other's key.
+  assert.deepEqual(up.pubKey, USER.publicKey);
+  assert.deepEqual(lp.pubKey, LSP.publicKey);
+  const digest = apoSighash(bc.fundingWitnessScript(), tx, 0, SIGHASH_ANYPREVOUTANYSCRIPT, CAP);
+  assert.ok(nobleMlDsa.verify(digest, up.sig.slice(0, 2420), USER.publicKey), "user partial verifies");
+  assert.ok(nobleMlDsa.verify(digest, lp.sig.slice(0, 2420), LSP.publicKey), "lsp partial verifies");
+});
+
+test("full lifecycle via TwoPartyChannel: open → settle (chains + conserves)", async () => {
+  const ch = localTwoPartyChannel(params, { secretKey: USER.secretKey, pub: USER.publicKey }, { secretKey: LSP.secretKey, pub: LSP.publicKey }, nobleMlDsa);
+
+  const update = await ch.openUpdate(STATE);
+  assert.match(update.hex, /^020000000001/, "update is BIP141 witness-serialized");
+
+  const uValue = CAP - FEE;
+  const init = 600_000_000n, peer = uValue - FEE - init;
+  const settlement = await ch.settle({
+    updateOutpoint: { txid: update.txid, n: 0 }, updateValueSat: uValue, prevState: STATE,
+    initiatorBalanceSat: init, peerBalanceSat: peer,
+  });
+  // settlement spends the update output → txid chaining is correct
+  assert.deepEqual(settlement.tx.vin[0].prevout.txid, update.txid);
+  assert.equal(settlement.tx.vin[0].sequence, CSV);
+  assert.equal(settlement.tx.vout[0].value, init);
+  assert.equal(settlement.tx.vout[1].value, peer);
+  assert.match(settlement.hex, /^020000000001/);
+});
+
+test("supersede via TwoPartyChannel chains from the prior update", async () => {
+  const ch = localTwoPartyChannel(params, { secretKey: USER.secretKey, pub: USER.publicKey }, { secretKey: LSP.secretKey, pub: LSP.publicKey }, nobleMlDsa);
+  const update = await ch.openUpdate(STATE);
+  const sup = await ch.supersede({ prevOutpoint: { txid: update.txid, n: 0 }, prevValueSat: CAP - FEE, prevState: STATE, newState: STATE + 1 });
+  assert.deepEqual(sup.tx.vin[0].prevout.txid, update.txid);
+  assert.equal(sup.tx.locktime, STATE + 1, "nLockTime clears the prior IF-branch CLTV floor");
+  assert.equal(sup.tx.vin[0].sequence, 0xfffffffe, "non-final so CLTV is active");
+});
+
+test("cooperative close via TwoPartyChannel spends funding directly", async () => {
+  const ch = localTwoPartyChannel(params, { secretKey: USER.secretKey, pub: USER.publicKey }, { secretKey: LSP.secretKey, pub: LSP.publicKey }, nobleMlDsa);
+  const init = 700_000_000n, peer = CAP - FEE - init;
+  const close = await ch.cooperativeClose({ initiatorBalanceSat: init, peerBalanceSat: peer });
+  assert.deepEqual(close.tx.vin[0].prevout, params.funding);
+  assert.equal(close.tx.vout.length, 2);
+  assert.match(close.hex, /^020000000001/);
+});
+
+test("a party with the wrong key cannot co-sign (combine rejects it)", async () => {
+  // The LSP party is constructed with Mallory's key, but the channel funding commits the
+  // real B key — so the impostor's partial matches no committed keyhash and combine throws.
+  const bc = new EltooBroadcaster(params);
+  const user = new LocalParty(bc, USER.secretKey, USER.publicKey, nobleMlDsa);
+  const impostor = new LocalParty(bc, MAL.secretKey, MAL.publicKey, nobleMlDsa);
+  const ch = new TwoPartyChannel(bc, user, impostor);
+  await assert.rejects(() => ch.openUpdate(STATE), /exactly one partial must match|neither/);
+});

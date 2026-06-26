@@ -1,7 +1,7 @@
 // soq-lightning-sdk — B1 stagenet canary (the FIRST thing run on the fresh chain post-reset).
 //
 // Proves the B1 control-flow restore is LIVE end-to-end on the deployed stagenet node:
-//   0. activation — getdeploymentinfo shows v6_controlflow active
+//   0. activation — getblocktemplate rules show v6_controlflow (advisory; step 3 is the real proof)
 //   1. fund       — soq-signer funds a keyhash-2-of-2 v6 output
 //   2. update     — spend funding (APO 0x42) -> a B1 eLTOO output (IF/CLTV ratchet, state S)
 //   3. ratchet-   — spend U via the IF branch BELOW the state floor -> node REJECTS (OP_CLTV enforces)
@@ -138,12 +138,18 @@ async function main() {
     return;
   }
 
-  // --- 0. activation gate ---
-  log("0: checking v6_controlflow is active…");
-  const dep = await nodeRpc("getdeploymentinfo", [], opR(cfg)).catch(() => null);
-  const active = dep?.deployments?.v6_controlflow?.active ?? dep?.deployments?.v6_controlflow?.bip9?.status === "active";
-  log(`  v6_controlflow active = ${active}`);
-  if (!active) throw new Error("v6_controlflow is NOT active — the reset did not deploy the B1 deployment");
+  // --- 0. activation probe (ADVISORY) ---
+  // This codebase has no getdeploymentinfo, and getblockchaininfo.bip9_softforks omits ALWAYS_ACTIVE
+  // forks. getblocktemplate.rules lists active deployments by name (gbt_force=true → plain
+  // "v6_controlflow", no "!" prefix). We DON'T hard-abort on it: the definitive proof of activation is
+  // the step-3 ratchet rejection (a below-floor OP_CLTV spend is only rejected when the opcode executes).
+  log("0: probing v6_controlflow activation (advisory)…");
+  let active = false;
+  try {
+    const gbt = await nodeRpc("getblocktemplate", [{ rules: ["segwit"] }], opR(cfg));
+    active = (gbt?.rules ?? []).some((r: string) => String(r).replace(/^!/, "") === "v6_controlflow");
+  } catch (e: any) { log(`  (getblocktemplate probe failed: ${e?.message ?? e})`); }
+  log(`  v6_controlflow in gbt rules = ${active}${active ? "" : "  — NOT detected via RPC; proceeding (step 3 is the real proof)"}`);
 
   // --- 1. fund ---
   log("1: funding keyhash-2-of-2 via soq-signer…");
@@ -165,8 +171,20 @@ async function main() {
   // --- 3. ratchet NEGATIVE: IF branch below the floor must be REJECTED by OP_CLTV ---
   const lo = buildIfSpend(uTxid, uValue, floor - 50);
   const loRes = await mempoolAccept(cfg, lo.hex);
-  if (loRes.allowed) throw new Error(`RATCHET BROKEN: a below-floor (state<${floor}) update was ACCEPTED — OP_CLTV not enforced`);
-  log(`3: ratchet- below-floor update REJECTED ✓ (reason: ${loRes.reason}) — OP_CLTV enforces on-chain`);
+  if (loRes.allowed) {
+    // NOT a consensus bug. testmempoolaccept uses the mempool/POLICY flag set, which enforces
+    // V6_CONTROLFLOW only if the relaying node sets -promiscuousmempoolflags to include bit 26
+    // (1<<26 = 67108864), or the flag is in STANDARD_SCRIPT_VERIFY_FLAGS. OP_CLTV IS enforced at
+    // CONSENSUS (ConnectBlock) regardless — a below-floor tx may be mempool-allowed here but can
+    // NEVER confirm in a block. So this is a RELAY-POLICY gap, not a broken opcode.
+    throw new Error(
+      `ratchet- : below-floor (state<${floor}) update was MEMPOOL-ALLOWED. This is a RELAY-POLICY ` +
+      `gap, NOT a consensus bug — the relaying node's mempool is not enforcing V6_CONTROLFLOW. ` +
+      `Fix: add bit 26 (67108864) to -promiscuousmempoolflags (or add the V6 covenant flags to ` +
+      `STANDARD_SCRIPT_VERIFY_FLAGS) and restart, then re-run. To confirm consensus DOES enforce it: ` +
+      `sendrawtransaction this tx (${lo.txidDisplay}) and verify it never confirms in a block.`);
+  }
+  log(`3: ratchet- below-floor update REJECTED at mempool ✓ (reason: ${loRes.reason}) — V6_CONTROLFLOW enforces OP_CLTV`);
 
   // --- 4. ratchet POSITIVE: IF branch at the floor supersedes ---
   const hi = buildIfSpend(uTxid, uValue, floor);
@@ -190,7 +208,7 @@ async function main() {
     log(`  settlement broadcast ${settleTxid}`); await waitConfirmed(cfg, settleTxid);
   }
 
-  console.log(JSON.stringify({ mode: "live", v6_controlflow: true,
+  console.log(JSON.stringify({ mode: "live", v6_controlflow: active,
     funding: `${fundTxid}:${fundVout}`, update: uTxid, ratchet_reject_reason: loRes.reason,
     supersede: hiTxid, settle: settleTxid ?? null }, null, 2));
   log("✅ B1 CANARY GREEN: ratchet enforces (below-floor rejected, at-floor superseded) live on stagenet.");

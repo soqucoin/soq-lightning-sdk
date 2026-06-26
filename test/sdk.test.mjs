@@ -2,7 +2,10 @@
 // peer (manager.go semantics: monotonic state_index, balance conservation).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { SoqLightning } from "../dist/index.js";
+import {
+  SoqLightning, EltooBroadcaster, p2wshV6, txid, toHex,
+  nobleMlDsa, mlDsaKeygen,
+} from "../dist/index.js";
 
 // reusable mock peer; returns a fetchImpl
 function mockPeer() {
@@ -150,4 +153,79 @@ test("SoqLightning.close treats dropped-response-after-mutation as success", asy
   const ch = await ln.openChannel({ pubKeyHex: "aa", address: "soq1x", capacitySat: 100000000, csvDelay: 144 });
   const r = await ln.close(ch.channel_id);
   assert.ok(r.accepted, "close confirmed via state re-read despite empty reply");
+});
+
+// ── WS5: selfCustodialPay E2E against a REAL-KEY mock LSP ──
+// Unlike the accept-and-store mockPeer above, this LSP holds a real ML-DSA key and co-signs
+// BOTH the update and the settlement (F1) — so the spoke ends the round holding a fully-signed
+// (Tu, Ts) it can broadcast to close without the LSP (spec §E). The mock enforces logical
+// balance conservation (manager.go:271) and mirrors the v1 fee policy (initiator pays 2·fee).
+const SC_USER = mlDsaKeygen(new Uint8Array(32).fill(0x41));
+const SC_LSP = mlDsaKeygen(new Uint8Array(32).fill(0x42));
+const SC_CAP = 1_000_000_000;
+const SC_CSV = 6;
+const SC_FEE = 10_000_000n;
+const SC_CTX = {
+  userSecretKey: SC_USER.secretKey, userPub: SC_USER.publicKey,
+  funding: { txid: new Uint8Array(32).fill(0xfd), n: 0 },
+  initiatorScriptPubKey: p2wshV6(Uint8Array.of(0x51)),
+  peerScriptPubKey: p2wshV6(Uint8Array.of(0x51, 0x51)),
+  feeSat: SC_FEE, mldsa: nobleMlDsa,
+};
+
+function realKeyLspPeer() {
+  const params = {
+    funding: SC_CTX.funding, capacitySat: BigInt(SC_CAP),
+    initiatorPub: SC_USER.publicKey, peerPub: SC_LSP.publicKey,
+    initiatorScriptPubKey: SC_CTX.initiatorScriptPubKey, peerScriptPubKey: SC_CTX.peerScriptPubKey,
+    settlementCsv: SC_CSV, feeSat: SC_FEE,
+  };
+  const lspBc = new EltooBroadcaster(params);
+  const chans = new Map();
+  const ok = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  return async (url, init) => {
+    const path = new URL(url).pathname;
+    const body = init?.body ? JSON.parse(init.body) : {};
+    const m = path.match(/^\/v1\/channels\/([^/]+)(\/update)?$/);
+    if (!m) return new Response("{}", { status: 404 });
+    const id = m[1];
+    if (!chans.has(id)) chans.set(id, { channel_id: id, initiator_pub_key_hex: toHex(SC_USER.publicKey),
+      peer_pub_key_hex: toHex(SC_LSP.publicKey), capacity_sat: SC_CAP, initiator_balance_sat: SC_CAP,
+      peer_balance_sat: 0, state_index: 0, state: "open", csv_delay: SC_CSV, created_at_unix: 0 });
+    const ch = chans.get(id);
+    if (m[2] === "/update") {
+      // The LSP enforces logical conservation, then co-signs BOTH txs (the F1 response).
+      if (body.initiator_balance_sat + body.peer_balance_sat !== ch.capacity_sat) return ok({ accepted: false, reject_reason: "balance" });
+      const updateTx = lspBc.buildFundingUpdateTx(body.state_index);
+      const uValue = updateTx.vout[0].value;
+      const settlementTx = lspBc.buildSettlementTx({
+        updateOutpoint: { txid: txid(updateTx), n: 0 }, updateValueSat: uValue,
+        initiatorBalanceSat: BigInt(body.initiator_balance_sat) - 2n * SC_FEE, peerBalanceSat: BigInt(body.peer_balance_sat),
+      });
+      const up = lspBc.signFundingPartial(updateTx, SC_LSP.secretKey, SC_LSP.publicKey, nobleMlDsa);
+      const st = lspBc.signEltooPartial(settlementTx, uValue, SC_LSP.secretKey, SC_LSP.publicKey, nobleMlDsa);
+      ch.state_index = body.state_index; ch.initiator_balance_sat = body.initiator_balance_sat; ch.peer_balance_sat = body.peer_balance_sat;
+      return ok({ accepted: true, peer_signature_hex: toHex(up.sig), settlement_signature_hex: toHex(st.sig) });
+    }
+    return ok(ch); // GET
+  };
+}
+
+test("selfCustodialPay returns a fully-signed, closeable (Tu, Ts) [WS5 E2E, real-key mock LSP]", async () => {
+  const ln = new SoqLightning({ baseUrl: "https://mock", fetchImpl: realKeyLspPeer() });
+  const { update, settlement } = await ln.selfCustodialPay("sc1", 100_000_000, SC_CTX);
+
+  // Both fully co-signed by user + LSP, witness-serialized → broadcastable as a unilateral close.
+  assert.match(update.hex, /^020000000001/);
+  assert.match(settlement.hex, /^020000000001/);
+  assert.deepEqual(settlement.tx.vin[0].prevout.txid, update.txid);
+
+  // On-chain settlement is fee-deducted: initiator absorbs 2·fee, peer gets the full transfer.
+  assert.equal(Number(settlement.tx.vout[0].value), (SC_CAP - 100_000_000) - Number(2n * SC_FEE));
+  assert.equal(Number(settlement.tx.vout[1].value), 100_000_000);
+});
+
+test("selfCustodialPay rejects overspend before any network call", async () => {
+  const ln = new SoqLightning({ baseUrl: "https://mock", fetchImpl: realKeyLspPeer() });
+  await assert.rejects(() => ln.selfCustodialPay("sc2", SC_CAP + 1, SC_CTX), /insufficient/);
 });

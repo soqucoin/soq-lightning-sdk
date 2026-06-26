@@ -171,8 +171,20 @@ async function main() {
   // --- 3. ratchet NEGATIVE: IF branch below the floor must be REJECTED by OP_CLTV ---
   const lo = buildIfSpend(uTxid, uValue, floor - 50);
   const loRes = await mempoolAccept(cfg, lo.hex);
-  if (loRes.allowed) throw new Error(`RATCHET BROKEN: a below-floor (state<${floor}) update was ACCEPTED — OP_CLTV not enforced`);
-  log(`3: ratchet- below-floor update REJECTED ✓ (reason: ${loRes.reason}) — OP_CLTV enforces on-chain`);
+  if (loRes.allowed) {
+    // NOT a consensus bug. testmempoolaccept uses the mempool/POLICY flag set, which enforces
+    // V6_CONTROLFLOW only if the relaying node sets -promiscuousmempoolflags to include bit 26
+    // (1<<26 = 67108864), or the flag is in STANDARD_SCRIPT_VERIFY_FLAGS. OP_CLTV IS enforced at
+    // CONSENSUS (ConnectBlock) regardless — a below-floor tx may be mempool-allowed here but can
+    // NEVER confirm in a block. So this is a RELAY-POLICY gap, not a broken opcode.
+    throw new Error(
+      `ratchet- : below-floor (state<${floor}) update was MEMPOOL-ALLOWED. This is a RELAY-POLICY ` +
+      `gap, NOT a consensus bug — the relaying node's mempool is not enforcing V6_CONTROLFLOW. ` +
+      `Fix: add bit 26 (67108864) to -promiscuousmempoolflags (or add the V6 covenant flags to ` +
+      `STANDARD_SCRIPT_VERIFY_FLAGS) and restart, then re-run. To confirm consensus DOES enforce it: ` +
+      `sendrawtransaction this tx (${lo.txidDisplay}) and verify it never confirms in a block.`);
+  }
+  log(`3: ratchet- below-floor update REJECTED at mempool ✓ (reason: ${loRes.reason}) — V6_CONTROLFLOW enforces OP_CLTV`);
 
   // --- 4. ratchet POSITIVE: IF branch at the floor supersedes ---
   const hi = buildIfSpend(uTxid, uValue, floor);

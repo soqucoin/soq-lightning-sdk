@@ -49,14 +49,16 @@ const bc = new EltooBroadcaster(params);
 
 const b1Script = () => eltooUpdateScriptV6(STATE, A.publicKey, B.publicKey, { settlementCsv: CSV });
 
-test("buildFundingUpdateTx reproduces the canary's funding→update tx graph", () => {
-  // b1-canary.ts step 2: version 2, locktime 0, spends funding, output = capacity-fee to b1Spk.
-  const canaryU = {
-    version: 2, locktime: 0,
+test("buildFundingUpdateTx uses the spec/LSP locktime convention (stateNum+1)", () => {
+  // The canary's U used locktime 0 (consensus-valid since funding has no CLTV), but eLTOO
+  // (spec §B.3) + the LSP's Task-7 policy require locktime == stateNum+1. The rest of the
+  // graph matches: version 2, spends funding, output = capacity-fee to the eLTOO(stateNum) spk.
+  const expected = {
+    version: 2, locktime: STATE + 1,
     vin: [{ prevout: fundingOutpoint, sequence: 0xffffffff }],
     vout: [{ value: CAP - FEE, scriptPubKey: p2wshV6(b1Script()) }],
   };
-  assert.equal(toHex(serializeTx(bc.buildFundingUpdateTx(STATE))), toHex(serializeTx(canaryU)));
+  assert.equal(toHex(serializeTx(bc.buildFundingUpdateTx(STATE))), toHex(serializeTx(expected)));
 });
 
 test("assembleFundingSpend: node-layout witness + both 0x42 sigs validate", () => {

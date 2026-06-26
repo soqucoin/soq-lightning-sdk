@@ -83,11 +83,15 @@ export class EltooBroadcaster {
 
   // ---- unsigned tx builders (deterministic) ----
 
-  /** Tu,0 — spend the funding 2-of-2 to a fresh eLTOO(stateNum) output. value = capacity − fee. */
+  /** Tu,0 — spend the funding 2-of-2 to a fresh eLTOO(stateNum) output. value = capacity − fee.
+   *  nLockTime carries the state number (spec §B.3: `stateNum+1`). The funding output has no CLTV
+   *  so consensus ignores it (sequence is final), but the eLTOO convention + the LSP's policy
+   *  (manager.go Task 7) require `locktime == stateNum+1` — the canary's locktime-0 shortcut is
+   *  consensus-valid but the LSP rejects it. */
   buildFundingUpdateTx(stateNum: number): Tx {
     return {
       version: 2,
-      locktime: 0, // funding has no CLTV; locktime unconstrained
+      locktime: stateNum + 1,
       vin: [{ prevout: this.p.funding, sequence: 0xffffffff }],
       vout: [{ value: this.p.capacitySat - this.p.feeSat, scriptPubKey: p2wshV6(this.eltooScript(stateNum)) }],
     };

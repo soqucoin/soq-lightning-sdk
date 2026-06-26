@@ -16,7 +16,8 @@ import {
   EltooBroadcaster, type ChannelParams, type SignedTx,
 } from "./eltoo-broadcast.js";
 import {
-  SIGHASH_ANYPREVOUTANYSCRIPT, type Tx, type OutPoint, type KeyhashPartial,
+  SIGHASH_ANYPREVOUTANYSCRIPT, txid, toHex, fromHex, serializeTx, ctvHash,
+  type Tx, type OutPoint, type KeyhashPartial,
 } from "./channel.js";
 import type { MlDsa } from "./invoice.js";
 
@@ -140,4 +141,97 @@ export function localTwoPartyChannel(
     new LocalParty(bc, user.secretKey, user.pub, mldsa),
     new LocalParty(bc, lsp.secretKey, lsp.pub, mldsa),
   );
+}
+
+// ====================================================================
+// F1 self-custody stitch — consume the LSP's two response partials
+// ====================================================================
+
+/** Parse one LSP response signature (hex) into a KeyhashPartial under the LSP's pubkey.
+ *  The LSP returns a 2421-byte element (2420 ML-DSA ‖ 0x42 hashType). A short/garbage value
+ *  (e.g. the legacy "countersigned" stub, or a missing field) is rejected here with a clear
+ *  message — that is exactly the F1 failure the round must not silently accept. */
+function lspPartial(lspPub: Uint8Array, sigHex: string): KeyhashPartial {
+  const sig = fromHex(sigHex);
+  if (sig.length !== 2421)
+    throw new Error(
+      `LSP partial must be 2421 bytes (2420 ‖ hashType), got ${sig.length} — is the LSP returning a ` +
+      `real ML-DSA sig (WS2b deployed) rather than the "countersigned" stub?`);
+  if (sig[2420] !== SIGHASH_ANYPREVOUTANYSCRIPT)
+    throw new Error(`LSP partial hashType must be 0x42, got 0x${sig[2420].toString(16)}`);
+  return { pubKey: lspPub, sig };
+}
+
+/** F1 stitch: combine the LSP's two response partials with the user's into a fully-signed,
+ *  broadcastable (Tu, Ts) the user persists (spec §E) — so it can unilaterally close with no
+ *  further LSP contact. `lspUpdateSigHex` = the response `peer_signature_hex` (update),
+ *  `lspSettleSigHex` = `settlement_signature_hex` (settlement, F1). Throws if either sig is
+ *  the stub/wrong-length, or the combine can't match the committed keys. */
+export function combineLspRound(
+  bc: EltooBroadcaster,
+  a: {
+    updateTx: Tx; settlementTx: Tx; prevState: number;
+    userUpdate: KeyhashPartial; userSettle: KeyhashPartial;
+    lspPub: Uint8Array; lspUpdateSigHex: string; lspSettleSigHex: string;
+  },
+): { update: SignedTx; settlement: SignedTx } {
+  const update = bc.assembleFundingSpend(a.updateTx, [a.userUpdate, lspPartial(a.lspPub, a.lspUpdateSigHex)]);
+  const settlement = bc.assembleSettlement(a.settlementTx, a.prevState, [a.userSettle, lspPartial(a.lspPub, a.lspSettleSigHex)]);
+  return { update, settlement };
+}
+
+/** The LSP round-trip a live `pay()` performs. In production this is `LspClient.updateState`;
+ *  injectable so the round is testable with a mock LSP. The response MUST carry BOTH partials. */
+export interface LspRoundDeps {
+  updateState(req: {
+    state_index: number; initiator_balance_sat: number; peer_balance_sat: number;
+    update_tx_hex: string; settlement_tx_hex: string; ctv_hash: string;
+  }): Promise<{
+    accepted: boolean; reject_reason?: string;
+    peer_signature_hex?: string; settlement_signature_hex?: string;
+  }>;
+}
+
+/** One F1-complete update round against the LSP — the real `pay()` path. The user builds the
+ *  update + settlement, signs ITS partials locally, sends the txs, and the LSP returns its two
+ *  partials; `combineLspRound` stitches them into the fully-signed (Tu, Ts) the user persists.
+ *  The user ends the round able to close unilaterally (spec §E) — that is the F1 fix end-to-end.
+ *  Throws if the LSP rejects, or omits `settlement_signature_hex` (F1 not deployed on the LSP). */
+export async function lspUpdateRound(
+  bc: EltooBroadcaster, deps: LspRoundDeps,
+  a: {
+    stateNum: number; initiatorBalanceSat: bigint; peerBalanceSat: bigint;
+    userSecretKey: Uint8Array; userPub: Uint8Array; lspPub: Uint8Array; mldsa: MlDsa;
+  },
+): Promise<{ update: SignedTx; settlement: SignedTx }> {
+  const updateTx = bc.buildFundingUpdateTx(a.stateNum);
+  const updateValueSat = updateTx.vout[0].value;
+  const settlementTx = bc.buildSettlementTx({
+    updateOutpoint: { txid: txid(updateTx), n: 0 }, updateValueSat,
+    initiatorBalanceSat: a.initiatorBalanceSat, peerBalanceSat: a.peerBalanceSat,
+  });
+
+  // The user signs its own partials (own key only) BEFORE handing the txs to the LSP.
+  const userUpdate = bc.signFundingPartial(updateTx, a.userSecretKey, a.userPub, a.mldsa);
+  const userSettle = bc.signEltooPartial(settlementTx, updateValueSat, a.userSecretKey, a.userPub, a.mldsa);
+
+  const resp = await deps.updateState({
+    state_index: a.stateNum,
+    initiator_balance_sat: Number(a.initiatorBalanceSat),
+    peer_balance_sat: Number(a.peerBalanceSat),
+    update_tx_hex: toHex(serializeTx(updateTx)),
+    settlement_tx_hex: toHex(serializeTx(settlementTx)),
+    ctv_hash: toHex(ctvHash(settlementTx, 0)),
+  });
+  if (!resp.accepted) throw new Error(`LSP rejected update: ${resp.reject_reason ?? "unknown"}`);
+  if (!resp.peer_signature_hex || !resp.settlement_signature_hex)
+    throw new Error(
+      "LSP did not return BOTH partials — settlement_signature_hex missing. The user cannot " +
+      "self-custodially close without it (F1 not deployed on the LSP?).");
+
+  return combineLspRound(bc, {
+    updateTx, settlementTx, prevState: a.stateNum,
+    userUpdate, userSettle,
+    lspPub: a.lspPub, lspUpdateSigHex: resp.peer_signature_hex, lspSettleSigHex: resp.settlement_signature_hex,
+  });
 }

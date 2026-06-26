@@ -14,6 +14,7 @@ export * from "./invoice.js";
 export * from "./client.js";
 export * from "./sdk.js";
 export * from "./channel.js";
+export * from "./eltoo-broadcast.js";
 export * from "./watchtower.js";
 export * from "./htlc.js";
 export * from "./mldsa.js";

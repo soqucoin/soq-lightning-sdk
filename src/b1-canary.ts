@@ -1,7 +1,7 @@
 // soq-lightning-sdk — B1 stagenet canary (the FIRST thing run on the fresh chain post-reset).
 //
 // Proves the B1 control-flow restore is LIVE end-to-end on the deployed stagenet node:
-//   0. activation — getdeploymentinfo shows v6_controlflow active
+//   0. activation — getblocktemplate rules show v6_controlflow (advisory; step 3 is the real proof)
 //   1. fund       — soq-signer funds a keyhash-2-of-2 v6 output
 //   2. update     — spend funding (APO 0x42) -> a B1 eLTOO output (IF/CLTV ratchet, state S)
 //   3. ratchet-   — spend U via the IF branch BELOW the state floor -> node REJECTS (OP_CLTV enforces)
@@ -138,12 +138,18 @@ async function main() {
     return;
   }
 
-  // --- 0. activation gate ---
-  log("0: checking v6_controlflow is active…");
-  const dep = await nodeRpc("getdeploymentinfo", [], opR(cfg)).catch(() => null);
-  const active = dep?.deployments?.v6_controlflow?.active ?? dep?.deployments?.v6_controlflow?.bip9?.status === "active";
-  log(`  v6_controlflow active = ${active}`);
-  if (!active) throw new Error("v6_controlflow is NOT active — the reset did not deploy the B1 deployment");
+  // --- 0. activation probe (ADVISORY) ---
+  // This codebase has no getdeploymentinfo, and getblockchaininfo.bip9_softforks omits ALWAYS_ACTIVE
+  // forks. getblocktemplate.rules lists active deployments by name (gbt_force=true → plain
+  // "v6_controlflow", no "!" prefix). We DON'T hard-abort on it: the definitive proof of activation is
+  // the step-3 ratchet rejection (a below-floor OP_CLTV spend is only rejected when the opcode executes).
+  log("0: probing v6_controlflow activation (advisory)…");
+  let active = false;
+  try {
+    const gbt = await nodeRpc("getblocktemplate", [{ rules: ["segwit"] }], opR(cfg));
+    active = (gbt?.rules ?? []).some((r: string) => String(r).replace(/^!/, "") === "v6_controlflow");
+  } catch (e: any) { log(`  (getblocktemplate probe failed: ${e?.message ?? e})`); }
+  log(`  v6_controlflow in gbt rules = ${active}${active ? "" : "  — NOT detected via RPC; proceeding (step 3 is the real proof)"}`);
 
   // --- 1. fund ---
   log("1: funding keyhash-2-of-2 via soq-signer…");
@@ -190,7 +196,7 @@ async function main() {
     log(`  settlement broadcast ${settleTxid}`); await waitConfirmed(cfg, settleTxid);
   }
 
-  console.log(JSON.stringify({ mode: "live", v6_controlflow: true,
+  console.log(JSON.stringify({ mode: "live", v6_controlflow: active,
     funding: `${fundTxid}:${fundVout}`, update: uTxid, ratchet_reject_reason: loRes.reason,
     supersede: hiTxid, settle: settleTxid ?? null }, null, 2));
   log("✅ B1 CANARY GREEN: ratchet enforces (below-floor rejected, at-floor superseded) live on stagenet.");

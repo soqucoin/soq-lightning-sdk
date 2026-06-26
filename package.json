@@ -39,6 +39,7 @@
     "test": "npm run build && node --test test/*.test.mjs",
     "canary": "npm run build && node dist/canary.js",
     "two-party-canary": "npm run build && node dist/two-party-canary.js",
+    "self-custody-canary": "npm run build && node dist/self-custody-canary.js",
     "example:quickstart": "npm run build && node examples/quickstart.mjs",
     "prepublishOnly": "npm run build && npm test"
   },

@@ -89,6 +89,26 @@ export class TwoPartyChannel {
     return this.bc.assembleSettlement(tx, a.prevState, partials);
   }
 
+  /** One full update round (spec §D + §E) — the F1 fix. Both parties co-sign BOTH the update
+   *  AND its settlement in the same round, so the user ends the round holding a fully-signed
+   *  (Tu, Ts) pair it can broadcast to close with NO further LSP contact. A round that co-signs
+   *  only the update (the F1 bug) leaves Ts half-signed → the user cannot settle → §E
+   *  self-custody is broken. The settlement is co-signed over the UPDATE-OUTPUT value
+   *  (capacity − fee), NOT the capacity — the 0x42 sighash commits the amount. */
+  async updateRound(a: { stateNum: number; initiatorBalanceSat: bigint; peerBalanceSat: bigint }): Promise<{ update: SignedTx; settlement: SignedTx }> {
+    const updateTx = this.bc.buildFundingUpdateTx(a.stateNum);
+    const update = this.bc.assembleFundingSpend(updateTx, await this.bothFunding(updateTx));
+
+    const updateValueSat = updateTx.vout[0].value;
+    const settlementTx = this.bc.buildSettlementTx({
+      updateOutpoint: { txid: update.txid, n: 0 }, updateValueSat,
+      initiatorBalanceSat: a.initiatorBalanceSat, peerBalanceSat: a.peerBalanceSat,
+    });
+    const settlement = this.bc.assembleSettlement(settlementTx, a.stateNum, await this.bothEltoo(settlementTx, updateValueSat));
+
+    return { update, settlement };
+  }
+
   /** Cooperative close — both parties co-sign a direct funding spend to final balances (spec §F.1). */
   async cooperativeClose(a: { initiatorBalanceSat: bigint; peerBalanceSat: bigint }): Promise<SignedTx> {
     const tx = this.bc.buildCooperativeCloseTx(a);

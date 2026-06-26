@@ -89,6 +89,31 @@ test("cooperative close via TwoPartyChannel spends funding directly", async () =
   assert.match(close.hex, /^020000000001/);
 });
 
+test("updateRound co-signs BOTH txs — user can close without the LSP (F1 fix)", async () => {
+  const bc = new EltooBroadcaster(params);
+  const user = new LocalParty(bc, USER.secretKey, USER.publicKey, nobleMlDsa);
+  const lsp = new LocalParty(bc, LSP.secretKey, LSP.publicKey, nobleMlDsa);
+  const ch = new TwoPartyChannel(bc, user, lsp);
+
+  const uValue = CAP - FEE;
+  const init = 600_000_000n, peer = uValue - FEE - init;
+  const { update, settlement } = await ch.updateRound({ stateNum: STATE, initiatorBalanceSat: init, peerBalanceSat: peer });
+
+  // Both fully co-signed + chained → the user can broadcast Tu then Ts to close, no LSP needed.
+  assert.match(update.hex, /^020000000001/);
+  assert.match(settlement.hex, /^020000000001/);
+  assert.deepEqual(settlement.tx.vin[0].prevout.txid, update.txid);
+  assert.equal(settlement.tx.vout[0].value, init);
+  assert.equal(settlement.tx.vout[1].value, peer);
+
+  // F1 regression guard: WITHOUT the LSP's settlement partial (the bug Buddy's WS2b had —
+  // it co-signed only the update), the settlement cannot be assembled from the user's
+  // partial alone → the user could not unilaterally close. That is exactly what F1 fixes.
+  const settlementTx = bc.buildSettlementTx({ updateOutpoint: { txid: update.txid, n: 0 }, updateValueSat: uValue, initiatorBalanceSat: init, peerBalanceSat: peer });
+  const userOnly = await user.signEltoo(settlementTx, uValue);
+  assert.throws(() => bc.assembleSettlement(settlementTx, STATE, [userOnly, userOnly]), /initiator/);
+});
+
 test("a party with the wrong key cannot co-sign (combine rejects it)", async () => {
   // The LSP party is constructed with Mallory's key, but the channel funding commits the
   // real B key — so the impostor's partial matches no committed keyhash and combine throws.

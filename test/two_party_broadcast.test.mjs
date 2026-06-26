@@ -13,7 +13,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   EltooBroadcaster, LocalParty, TwoPartyChannel, localTwoPartyChannel,
-  apoSighash, p2wshV6, SIGHASH_ANYPREVOUTANYSCRIPT,
+  combineLspRound, lspUpdateRound,
+  apoSighash, p2wshV6, txid, toHex, SIGHASH_ANYPREVOUTANYSCRIPT,
   nobleMlDsa, mlDsaKeygen,
 } from "../dist/index.js";
 
@@ -112,6 +113,62 @@ test("updateRound co-signs BOTH txs — user can close without the LSP (F1 fix)"
   const settlementTx = bc.buildSettlementTx({ updateOutpoint: { txid: update.txid, n: 0 }, updateValueSat: uValue, initiatorBalanceSat: init, peerBalanceSat: peer });
   const userOnly = await user.signEltoo(settlementTx, uValue);
   assert.throws(() => bc.assembleSettlement(settlementTx, STATE, [userOnly, userOnly]), /initiator/);
+});
+
+// A mock LSP that independently rebuilds the round's txs (spec §D.2) and co-signs BOTH with
+// its own key, returning the two 2421-byte partials as hex — i.e. the F1-fixed LSP response.
+function mockLsp() {
+  const lspBc = new EltooBroadcaster(params);
+  return {
+    async updateState(req) {
+      const updateTx = lspBc.buildFundingUpdateTx(req.state_index);
+      const uValue = updateTx.vout[0].value;
+      const settlementTx = lspBc.buildSettlementTx({
+        updateOutpoint: { txid: txid(updateTx), n: 0 }, updateValueSat: uValue,
+        initiatorBalanceSat: BigInt(req.initiator_balance_sat), peerBalanceSat: BigInt(req.peer_balance_sat),
+      });
+      const up = lspBc.signFundingPartial(updateTx, LSP.secretKey, LSP.publicKey, nobleMlDsa);
+      const st = lspBc.signEltooPartial(settlementTx, uValue, LSP.secretKey, LSP.publicKey, nobleMlDsa);
+      return { accepted: true, peer_signature_hex: toHex(up.sig), settlement_signature_hex: toHex(st.sig) };
+    },
+  };
+}
+
+test("lspUpdateRound stitches both LSP partials → user holds a closeable (Tu, Ts) [F1 E2E]", async () => {
+  const bc = new EltooBroadcaster(params);
+  const uValue = CAP - FEE;
+  const init = 600_000_000n, peer = uValue - FEE - init;
+  const { update, settlement } = await lspUpdateRound(bc, mockLsp(), {
+    stateNum: STATE, initiatorBalanceSat: init, peerBalanceSat: peer,
+    userSecretKey: USER.secretKey, userPub: USER.publicKey, lspPub: LSP.publicKey, mldsa: nobleMlDsa,
+  });
+  // Fully signed by user + LSP, chained → broadcastable as a unilateral close, no LSP needed.
+  assert.match(update.hex, /^020000000001/);
+  assert.match(settlement.hex, /^020000000001/);
+  assert.deepEqual(settlement.tx.vin[0].prevout.txid, update.txid);
+  assert.equal(settlement.tx.vout[0].value, init);
+});
+
+test("lspUpdateRound throws if the LSP omits the settlement partial (F1 not deployed)", async () => {
+  const bc = new EltooBroadcaster(params);
+  const brokenLsp = { async updateState() { return { accepted: true, peer_signature_hex: "00".repeat(2421) }; } };
+  await assert.rejects(() => lspUpdateRound(bc, brokenLsp, {
+    stateNum: STATE, initiatorBalanceSat: 600_000_000n, peerBalanceSat: (CAP - FEE) - FEE - 600_000_000n,
+    userSecretKey: USER.secretKey, userPub: USER.publicKey, lspPub: LSP.publicKey, mldsa: nobleMlDsa,
+  }), /settlement_signature_hex missing|BOTH partials/);
+});
+
+test("combineLspRound rejects the legacy \"countersigned\" stub", async () => {
+  const bc = new EltooBroadcaster(params);
+  const updateTx = bc.buildFundingUpdateTx(STATE);
+  const uValue = CAP - FEE;
+  const settlementTx = bc.buildSettlementTx({ updateOutpoint: { txid: txid(updateTx), n: 0 }, updateValueSat: uValue, initiatorBalanceSat: 600_000_000n, peerBalanceSat: uValue - FEE - 600_000_000n });
+  const userUpdate = bc.signFundingPartial(updateTx, USER.secretKey, USER.publicKey, nobleMlDsa);
+  const userSettle = bc.signEltooPartial(settlementTx, uValue, USER.secretKey, USER.publicKey, nobleMlDsa);
+  assert.throws(() => combineLspRound(bc, {
+    updateTx, settlementTx, prevState: STATE, userUpdate, userSettle,
+    lspPub: LSP.publicKey, lspUpdateSigHex: "countersigned", lspSettleSigHex: "00".repeat(2421),
+  }), /2421 bytes|real ML-DSA/);
 });
 
 test("a party with the wrong key cannot co-sign (combine rejects it)", async () => {

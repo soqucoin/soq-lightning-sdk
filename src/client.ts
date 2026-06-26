@@ -67,7 +67,8 @@ export interface Channel {              // channelToMap rest.go:304-317
 export interface UpdateStateResp {      // rest.go updateState
   accepted: boolean;
   reject_reason?: string;
-  peer_signature_hex?: string;          // "countersigned" on success
+  peer_signature_hex?: string;          // 2421-byte LSP partial on the UPDATE (real ML-DSA once WS2b deployed)
+  settlement_signature_hex?: string;    // F1: 2421-byte LSP partial on the SETTLEMENT — needed to close (spec §E)
   echo?: { state_index: number; initiator_balance_sat: number; peer_balance_sat: number };
 }
 export interface CloseResp {            // rest.go cooperativeClose

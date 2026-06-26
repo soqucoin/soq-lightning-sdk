@@ -171,6 +171,38 @@ test("combineLspRound rejects the legacy \"countersigned\" stub", async () => {
   }), /2421 bytes|real ML-DSA/);
 });
 
+test("lspUpdateRound: LSP gets LOGICAL balances (sum=capacity); settlement outputs are fee-deducted", async () => {
+  // The seam WS5 depends on: the LSP enforces initiator+peer==capacity (manager.go:271), but the
+  // on-chain settlement pays capacity−2·fee. So logical (req) and settlement (tx) balances differ.
+  const bc = new EltooBroadcaster(params);
+  const settleInit = 600_000_000n, settlePeer = 380_000_000n;        // sum 980M = CAP − 2·FEE
+  const logicalInit = 620_000_000, logicalPeer = 380_000_000;        // sum 1B = capacity
+  let captured;
+  const lsp = {
+    async updateState(req) {
+      captured = req;
+      const lspBc = new EltooBroadcaster(params);
+      const updateTx = lspBc.buildFundingUpdateTx(req.state_index);
+      const uValue = updateTx.vout[0].value;
+      const settlementTx = lspBc.buildSettlementTx({ updateOutpoint: { txid: txid(updateTx), n: 0 }, updateValueSat: uValue, initiatorBalanceSat: settleInit, peerBalanceSat: settlePeer });
+      const up = lspBc.signFundingPartial(updateTx, LSP.secretKey, LSP.publicKey, nobleMlDsa);
+      const st = lspBc.signEltooPartial(settlementTx, uValue, LSP.secretKey, LSP.publicKey, nobleMlDsa);
+      return { accepted: true, peer_signature_hex: toHex(up.sig), settlement_signature_hex: toHex(st.sig) };
+    },
+  };
+  const { settlement } = await lspUpdateRound(bc, lsp, {
+    stateNum: STATE, initiatorBalanceSat: settleInit, peerBalanceSat: settlePeer,
+    reqBalances: { initiatorSat: logicalInit, peerSat: logicalPeer },
+    userSecretKey: USER.secretKey, userPub: USER.publicKey, lspPub: LSP.publicKey, mldsa: nobleMlDsa,
+  });
+  // The LSP received LOGICAL balances summing to capacity (its conservation check passes).
+  assert.equal(captured.initiator_balance_sat + captured.peer_balance_sat, Number(CAP));
+  assert.equal(captured.initiator_balance_sat, logicalInit);
+  // The settlement outputs are fee-deducted (sum = capacity − 2·fee).
+  assert.equal(settlement.tx.vout[0].value + settlement.tx.vout[1].value, CAP - 2n * FEE);
+  assert.equal(settlement.tx.vout[0].value, settleInit);
+});
+
 test("a party with the wrong key cannot co-sign (combine rejects it)", async () => {
   // The LSP party is constructed with Mallory's key, but the channel funding commits the
   // real B key — so the impostor's partial matches no committed keyhash and combine throws.

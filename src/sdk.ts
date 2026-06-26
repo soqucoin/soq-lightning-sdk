@@ -15,6 +15,23 @@ import {
   LspClient, RestClientOpts, Channel, CloseResp, FaucetResp,
 } from "./client.js";
 import type { TowerClient } from "./watchtower.js";
+import { EltooBroadcaster, type ChannelParams, type SignedTx } from "./eltoo-broadcast.js";
+import { lspUpdateRound } from "./two-party-broadcast.js";
+import { fromHex, toHex, ctvHash, type OutPoint } from "./channel.js";
+import type { MlDsa } from "./invoice.js";
+
+/** Everything the SDK needs to co-sign + self-custody a channel that the LSP-side facade does
+ *  NOT hold: the user's key, the funding outpoint (tracked at open), the on-chain payout
+ *  scripts, and the fee. Supplied per call so the demo `pay()` path stays key-free. */
+export interface SelfCustodyContext {
+  userSecretKey: Uint8Array;
+  userPub: Uint8Array;                  // MUST equal fromHex(channel.initiator_pub_key_hex)
+  funding: OutPoint;                    // the channel's funding outpoint (internal byte order)
+  initiatorScriptPubKey: Uint8Array;    // the user's on-chain settlement payout script
+  peerScriptPubKey: Uint8Array;         // the LSP's on-chain settlement payout script
+  feeSat: bigint;                       // fixed per-tx fee (v1, spec §H)
+  mldsa: MlDsa;
+}
 
 /** Context handed to the TX builder for one state transition. */
 export interface UpdateContext {
@@ -148,6 +165,75 @@ export class SoqLightning {
     if (after.initiator_balance_sat + after.peer_balance_sat !== after.capacity_sat)
       throw new Error("balance not conserved after update");
     return after;
+  }
+
+  /** Self-custodial pay — one F1-complete LSP round (spec §D + §E). Moves `amountSat` to the
+   *  peer and returns the fully-signed (Tu, Ts) the caller MUST persist: with them the user can
+   *  unilaterally close WITHOUT the LSP. Unlike pay() (the demo/opaque path) this does real
+   *  2-of-2 co-signing — the user signs locally; the LSP returns BOTH partials; they're combined.
+   *
+   *  Balance/fee model: the LSP accounts LOGICAL balances (sum == capacity, manager.go:271), but
+   *  the on-chain settlement can only pay capacity − 2·fee (one fee for the update tx, one for the
+   *  settlement). ⚠️ v1 policy (§H — FLAG): the INITIATOR pays both on-chain force-close fees (the
+   *  LN default), so its settlement output = logical balance − 2·fee. Revisit when fee policy lands.
+   *
+   *  ⚠️ TRUST GAP (WS2b Task 7): the LSP currently co-signs the settlement WITHOUT validating its
+   *  outputs match the recorded balances — a malicious spoke could submit a settlement that
+   *  over-pays itself. Safe only until the LSP settlement-output validation lands. */
+  async selfCustodialPay(channelId: string, amountSat: number, ctx: SelfCustodyContext): Promise<{ channel: Channel; update: SignedTx; settlement: SignedTx }> {
+    if (amountSat <= 0) throw new Error("amount must be positive");
+    const ch = await this.client.getChannel(channelId);
+    if (ch.state !== "open") throw new Error(`channel not open (state=${ch.state})`);
+    if (amountSat > ch.initiator_balance_sat) throw new Error("insufficient initiator balance");
+
+    const lspPub = fromHex(ch.peer_pub_key_hex);
+    const params: ChannelParams = {
+      funding: ctx.funding,
+      capacitySat: BigInt(ch.capacity_sat),
+      initiatorPub: ctx.userPub,
+      peerPub: lspPub,
+      initiatorScriptPubKey: ctx.initiatorScriptPubKey,
+      peerScriptPubKey: ctx.peerScriptPubKey,
+      settlementCsv: ch.csv_delay,
+      feeSat: ctx.feeSat,
+    };
+    const bc = new EltooBroadcaster(params);
+
+    // Logical balances after the payment (sum == capacity, for the LSP), then the on-chain
+    // settlement split: the initiator absorbs the 2·fee force-close cost.
+    const logicalInitiator = ch.initiator_balance_sat - amountSat;
+    const logicalPeer = ch.peer_balance_sat + amountSat;
+    const settlementInitiator = BigInt(logicalInitiator) - 2n * ctx.feeSat;
+    if (settlementInitiator < 0n)
+      throw new Error(`initiator balance ${logicalInitiator} cannot cover ${2n * ctx.feeSat} on-chain fees`);
+
+    const { update, settlement } = await lspUpdateRound(
+      bc,
+      { updateState: (req) => this.client.updateState(channelId, req) },
+      {
+        stateNum: ch.state_index + 1,
+        initiatorBalanceSat: settlementInitiator,
+        peerBalanceSat: BigInt(logicalPeer),
+        reqBalances: { initiatorSat: logicalInitiator, peerSat: logicalPeer }, // logical → LSP accounting
+        userSecretKey: ctx.userSecretKey, userPub: ctx.userPub, lspPub, mldsa: ctx.mldsa,
+      },
+    );
+
+    // §1.6 persist→arm→ack: arm the watchtower with the FULLY-SIGNED txs that will broadcast.
+    if (this.watchtower) {
+      await this.watchtower.client.register({
+        channel_id: channelId,
+        funding_txid: toHex(ctx.funding.txid.slice().reverse()),
+        funding_vout: ctx.funding.n,
+        state_index: ch.state_index + 1,
+        update_tx_hex: update.hex,
+        settlement_tx_hex: settlement.hex,
+        ctv_hash: toHex(ctvHash(settlement.tx, 0)),
+      });
+    }
+
+    const after = await this.client.getChannel(channelId);
+    return { channel: after, update, settlement };
   }
 
   /** Cooperative close → L1 settlement enqueued via the LSP.

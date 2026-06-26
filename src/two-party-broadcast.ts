@@ -200,7 +200,14 @@ export interface LspRoundDeps {
 export async function lspUpdateRound(
   bc: EltooBroadcaster, deps: LspRoundDeps,
   a: {
-    stateNum: number; initiatorBalanceSat: bigint; peerBalanceSat: bigint;
+    stateNum: number;
+    // SETTLEMENT-tx outputs (what each party receives on-chain). These deduct fees, so they
+    // sum to capacity − 2·fee — NOT the channel capacity.
+    initiatorBalanceSat: bigint; peerBalanceSat: bigint;
+    // Balances reported to the LSP for its accounting. The LSP enforces sum == capacity
+    // (manager.go:271), so these are the LOGICAL balances. Defaults to the settlement balances
+    // (correct only when fee == 0); a real channel MUST pass logical balances here.
+    reqBalances?: { initiatorSat: number; peerSat: number };
     userSecretKey: Uint8Array; userPub: Uint8Array; lspPub: Uint8Array; mldsa: MlDsa;
   },
 ): Promise<{ update: SignedTx; settlement: SignedTx }> {
@@ -217,8 +224,8 @@ export async function lspUpdateRound(
 
   const resp = await deps.updateState({
     state_index: a.stateNum,
-    initiator_balance_sat: Number(a.initiatorBalanceSat),
-    peer_balance_sat: Number(a.peerBalanceSat),
+    initiator_balance_sat: a.reqBalances?.initiatorSat ?? Number(a.initiatorBalanceSat),
+    peer_balance_sat: a.reqBalances?.peerSat ?? Number(a.peerBalanceSat),
     update_tx_hex: toHex(serializeTx(updateTx)),
     settlement_tx_hex: toHex(serializeTx(settlementTx)),
     ctv_hash: toHex(ctvHash(settlementTx, 0)),

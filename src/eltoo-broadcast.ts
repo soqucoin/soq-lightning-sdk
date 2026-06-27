@@ -129,6 +129,22 @@ export class EltooBroadcaster {
     };
   }
 
+  /** Ts,0 — the state-0 full-refund settlement (self-funded open, spec §3.2). The channel opens
+   *  with ALL funds on the initiator side, so the settlement spends the state-0 update output via
+   *  the ELSE/CSV branch to a SINGLE output (initiator payout = updateValue − fee). NOT
+   *  buildSettlementTx with a zero peer balance: the LSP REJECTS a 2-output state-0 settlement
+   *  (manager rule 7 — exactly one output), and peerScriptPubKey isn't known at open time. */
+  buildRefundSettlementTx(a: { updateOutpoint: OutPoint; updateValueSat: bigint }): Tx {
+    const refund = a.updateValueSat - this.p.feeSat;
+    if (refund <= 0n) throw new Error(`refund settlement: updateValue ${a.updateValueSat} ≤ fee ${this.p.feeSat}`);
+    return {
+      version: 2,
+      locktime: 0,
+      vin: [{ prevout: a.updateOutpoint, sequence: this.p.settlementCsv }],
+      vout: [{ value: refund, scriptPubKey: this.p.initiatorScriptPubKey }],
+    };
+  }
+
   /** Cooperative close (spec §F.1) — spend the funding 2-of-2 directly to final balances:
    *  no eLTOO output, no CSV. Outputs MUST sum to (capacity − fee). */
   buildCooperativeCloseTx(a: { initiatorBalanceSat: bigint; peerBalanceSat: bigint }): Tx {

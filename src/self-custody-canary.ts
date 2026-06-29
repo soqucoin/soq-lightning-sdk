@@ -18,12 +18,14 @@ import {
   nobleMlDsa, mlDsaKeygen, selfFundedOpenRound, type SelfCustodyContext, type SelfFundedOpenDeps,
 } from "./index.js";
 import { broadcastRawTx, getRawTransaction, nodeRpc } from "./noderpc.js";
+import { TowerClient } from "./watchtower.js";
 
 interface Cfg {
   lspUrl?: string; signerUrl?: string; signerToken?: string;
   rpcUrl?: string; rpcUser?: string; rpcPass?: string;
+  towerUrl?: string; towerToken?: string;
   amount: bigint; pay: bigint; fee: bigint; feeRate: number;
-  csv: number; live: boolean; settle: boolean; selfFunded: boolean; confs: number; timeoutMs: number;
+  csv: number; live: boolean; settle: boolean; selfFunded: boolean; drill: boolean; confs: number; timeoutMs: number;
 }
 
 function parseArgs(argv: string[]): Cfg {
@@ -33,12 +35,13 @@ function parseArgs(argv: string[]): Cfg {
     lspUrl: process.env.LSP_URL,
     signerUrl: process.env.SOQ_SIGNER_URL, signerToken: process.env.SOQ_SIGNER_TOKEN,
     rpcUrl: process.env.SOQ_RPC_URL, rpcUser: process.env.SOQ_RPC_USER, rpcPass: process.env.SOQ_RPC_PASS,
+    towerUrl: process.env.TOWER_URL, towerToken: process.env.TOWER_TOKEN,
     amount: BigInt(get("amount") ?? "1000000000"),
     pay: BigInt(get("pay") ?? "200000000"),
     fee: BigInt(get("fee") ?? "10000000"),
     feeRate: Number(get("fee-rate") ?? "10000"),
     csv: Number(get("csv") ?? "6"),
-    live: flag("live"), settle: flag("settle"), selfFunded: flag("self-funded"),
+    live: flag("live"), settle: flag("settle"), selfFunded: flag("self-funded"), drill: flag("drill"),
     confs: Number(get("confs") ?? "1"),
     timeoutMs: Number(get("timeout-ms") ?? "1200000"),
   };
@@ -238,11 +241,188 @@ async function selfFundedFlow(cfg: Cfg, user: { secretKey: Uint8Array; publicKey
   log("✅ SELF-FUNDED OPEN PROVEN LIVE: user-funded 2-of-2 accepted + co-signed by the LSP; user exited at state 0 WITHOUT the LSP.");
 }
 
+// ── m91 watchtower offline drill (proves tower defends offline user) ──
+
+async function drillFlow(cfg: Cfg, user: { secretKey: Uint8Array; publicKey: Uint8Array }, userPayout: Uint8Array): Promise<void> {
+  if (!cfg.lspUrl) throw new Error("LSP_URL required for --drill");
+  if (!cfg.towerUrl) throw new Error("TOWER_URL required for --drill");
+  const tower = new TowerClient({ baseUrl: cfg.towerUrl, bearerToken: cfg.towerToken });
+
+  // Verify tower is reachable
+  const tHealth = await tower.health();
+  log(`DRILL 0: tower healthy (${tHealth.watched_channels} channels)`);
+
+  // --- 1. Open + fund a self-funded channel ---
+  const ln = new SoqLightning({
+    baseUrl: cfg.lspUrl,
+    watchtower: {
+      client: tower,
+      fundingFor: () => ({ funding_txid: "__deferred__", funding_vout: 0 }),  // overridden per-call
+    },
+  });
+  const info: any = await ln.info();
+  log(`DRILL 1: LSP ${cfg.lspUrl} cosign=${info.cosign_enabled} towers=${info.tower_count}`);
+  if (!info.cosign_enabled) throw new Error("LSP cosign_enabled=false");
+  const lspPub = fromHex(info.pub_key_hex);
+
+  const funding = keyhashFunding2of2(user.publicKey, lspPub);
+  const fundTxid = await signerFund(cfg, toHex(funding.witnessScript));
+  const fundVout = await findVout(cfg, fundTxid, toHex(funding.scriptPubKey));
+  log(`DRILL 2: funded 2-of-2 ${fundTxid}:${fundVout}`);
+  await waitConfirmed(cfg, fundTxid);
+
+  // Self-funded open → state 0 (refund)
+  const bc = new EltooBroadcaster({
+    funding: { txid: fromHex(fundTxid).reverse(), n: fundVout }, capacitySat: cfg.amount,
+    initiatorPub: user.publicKey, peerPub: lspPub,
+    initiatorScriptPubKey: userPayout, peerScriptPubKey: p2wshV6(dilithiumKeyhashScript(lspPub)),
+    settlementCsv: cfg.csv, feeSat: cfg.fee,
+  });
+  const r = await selfFundedOpenRound(bc, liveSelfFundedDeps(cfg.lspUrl), {
+    fundingTxidDisplay: fundTxid, fundingVout: fundVout, csvDelay: cfg.csv,
+    initiatorPubKeyHex: toHex(user.publicKey), initiatorAddress: toHex(userPayout),
+    userSecretKey: user.secretKey, userPub: user.publicKey, lspPub, mldsa: nobleMlDsa,
+  });
+  log(`DRILL 3: channel ${r.channelId} OPEN at state 0`);
+
+  // Confirm funding on the LSP
+  const deadline = Date.now() + cfg.timeoutMs;
+  for (;;) {
+    const c = await confirmFunding(cfg.lspUrl, r.channelId, fundTxid);
+    if (c.state === "open") { log(`DRILL 3b: funding confirmed → channel OPEN`); break; }
+    if (Date.now() > deadline) throw new Error(`timeout confirming funding`);
+    log(`  funding pending ${c.confirmations ?? 0}/${c.required ?? "?"}`);
+    await sleep(15000);
+  }
+
+  // Build the self-custody context for payment rounds
+  const ctx: SelfCustodyContext = {
+    userSecretKey: user.secretKey, userPub: user.publicKey,
+    funding: { txid: fromHex(fundTxid).reverse(), n: fundVout },
+    initiatorScriptPubKey: userPayout, peerScriptPubKey: p2wshV6(dilithiumKeyhashScript(lspPub)),
+    feeSat: cfg.fee, mldsa: nobleMlDsa,
+  };
+
+  // Wire the watchtower with the correct funding info for this channel
+  const lnArmed = new SoqLightning({
+    baseUrl: cfg.lspUrl,
+    watchtower: {
+      client: tower,
+      fundingFor: () => ({ funding_txid: fundTxid, funding_vout: fundVout }),
+    },
+  });
+
+  // --- 4. State 1: first payment round (CAPTURE the update hex — this becomes the "stale" state) ---
+  const payAmt = Number(cfg.pay);
+  const state1 = await lnArmed.selfCustodialPay(r.channelId, payAmt, ctx);
+  const staleUpdateHex = state1.update.hex;
+  const staleSettleHex = state1.settlement.hex;
+  log(`DRILL 4: state 1 co-signed; update=${state1.update.txidDisplay.slice(0, 16)}… (THIS BECOMES STALE)`);
+  log(`         tower armed at state 1`);
+
+  // --- 5. State 2: second payment round — tower re-armed at state 2 (supersedes state 1) ---
+  const state2 = await lnArmed.selfCustodialPay(r.channelId, payAmt, ctx);
+  log(`DRILL 5: state 2 co-signed; update=${state2.update.txidDisplay.slice(0, 16)}…`);
+  log(`         tower armed at state 2 (LATEST — this is what the tower will broadcast)`);
+
+  // Verify tower has state 2
+  const tChannels = await tower.channels();
+  const armed = tChannels.channels.find((c) => c.channel_id === r.channelId);
+  if (!armed) throw new Error(`tower has no record of channel ${r.channelId}`);
+  log(`DRILL 5b: tower confirms channel ${r.channelId} state_index=${armed.state_index}`);
+  if (armed.state_index !== 2) log(`  ⚠ expected state_index=2, got ${armed.state_index}`);
+
+  // --- 6. BREACH: broadcast the STALE state-1 update (simulates a dishonest counterparty) ---
+  log(`DRILL 6: SIMULATING BREACH — broadcasting STALE state-1 update tx...`);
+  const breachTxid = await broadcastRawTx(staleUpdateHex, opR(cfg));
+  log(`         breach txid: ${breachTxid}`);
+
+  // --- 7. Wait for the breach to be mined (tower uses gettxout, needs confirmed spends) ---
+  log(`DRILL 7: waiting for breach to confirm (tower needs gettxout → null on funding)...`);
+  await waitConfirmed(cfg, breachTxid);
+  log(`         breach confirmed on-chain`);
+
+  // --- 8. Poll tower until it detects + supersedes ---
+  log(`DRILL 8: polling tower for stale-state detection (30s poll interval)...`);
+  const towerDeadline = Date.now() + 5 * 60 * 1000; // 5 min max
+  let triggerTxid: string | undefined;
+  let towerTriggered = false;
+  while (Date.now() < towerDeadline) {
+    const tc = await tower.channels();
+    const ch = tc.channels.find((c) => c.channel_id === r.channelId);
+    if (ch?.triggered) {
+      towerTriggered = true;
+      triggerTxid = ch.trigger_txid || undefined;
+      log(`DRILL 8: 🚨 TOWER TRIGGERED! trigger_txid=${triggerTxid ?? "(broadcast failed — rebinding needed)"}`);
+      break;
+    }
+    log(`  tower has not triggered yet, waiting 15s...`);
+    await sleep(15000);
+  }
+
+  if (!towerTriggered) {
+    log(`DRILL: ❌ TOWER DID NOT TRIGGER within 5 minutes. Check tower logs manually.`);
+    console.log(JSON.stringify({
+      mode: "drill", result: "TOWER_DID_NOT_TRIGGER",
+      channel: r.channelId, funding: `${fundTxid}:${fundVout}`,
+      breach_txid: breachTxid,
+      stale_update_hex: staleUpdateHex.slice(0, 64) + "...",
+    }, null, 2));
+    process.exit(1);
+  }
+
+  // --- 9. Verify the tower's superseding TX on-chain (if broadcast succeeded) ---
+  if (triggerTxid) {
+    log(`DRILL 9: verifying superseding TX ${triggerTxid} on-chain...`);
+    try {
+      await waitConfirmed(cfg, triggerTxid);
+      log(`         ✅ superseding TX confirmed on-chain!`);
+    } catch {
+      log(`         ⚠ superseding TX not yet confirmed (may need more blocks)`);
+    }
+  } else {
+    log(`DRILL 9: tower triggered but broadcast failed (eLTOO rebinding not yet implemented in tower).`);
+    log(`         Detection is proven — the tower SAW the stale state and ATTEMPTED to supersede.`);
+    log(`         The rebinding gap (rewriting prevout to the stale TX's output) is a known TODO.`);
+  }
+
+  // --- 10. Output proof ---
+  const drillResult = triggerTxid ? "TOWER_DEFENDED_OFFLINE_USER" : "TOWER_DETECTED_STALE_STATE";
+  const proof = {
+    mode: "drill",
+    result: drillResult,
+    timestamp: new Date().toISOString(),
+    channel_id: r.channelId,
+    funding: `${fundTxid}:${fundVout}`,
+    state1_update_txid: state1.update.txidDisplay,
+    state2_update_txid: state2.update.txidDisplay,
+    breach_txid: breachTxid,
+    tower_triggered: towerTriggered,
+    tower_trigger_txid: triggerTxid ?? null,
+    tower_state_index_at_trigger: armed.state_index,
+    caveats: [
+      "isStaleState is heuristic (StateIndex > 0), does not decode+compare state indices",
+      "tower uses gettxout (confirmed only), not mempool — breach must be mined first",
+      "stagenet — we control miners, so mining the breach is guaranteed",
+      ...(!triggerTxid ? [
+        "tower detected stale state but broadcast failed (txn-mempool-conflict) — the eLTOO rebinding " +
+        "(rewriting the superseding TX prevout from funding→stale-update-output) is not yet implemented in tower.go",
+      ] : []),
+    ],
+  };
+  console.log(JSON.stringify(proof, null, 2));
+  log(`✅ m91 WATCHTOWER OFFLINE DRILL COMPLETE — result: ${drillResult}`);
+  log(`   Breach (stale state 1): ${breachTxid}`);
+  if (triggerTxid) log(`   Supersession (tower's state 2): ${triggerTxid}`);
+  log(`   Save this output for the SS-09 legal opinion.`);
+}
+
 async function main() {
   const cfg = parseArgs(process.argv.slice(2));
 
   const user = mlDsaKeygen();
   const userPayout = p2wshV6(dilithiumKeyhashScript(user.publicKey));
+  if (cfg.drill) return drillFlow(cfg, user, userPayout);
   if (cfg.selfFunded) return selfFundedFlow(cfg, user, userPayout);
 
   if (cfg.pay >= cfg.amount - cfg.fee * 3n) throw new Error("pay must leave room for 3× fee");

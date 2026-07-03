@@ -12,7 +12,7 @@
 //   await ln.close(ch.channel_id);
 
 import {
-  LspClient, RestClientOpts, Channel, CloseResp, FaucetResp,
+  LspClient, RestClientOpts, Channel, CloseResp, FaucetResp, LspInvoice,
 } from "./client.js";
 import type { TowerClient } from "./watchtower.js";
 import { EltooBroadcaster, type ChannelParams, type SignedTx } from "./eltoo-broadcast.js";
@@ -234,6 +234,89 @@ export class SoqLightning {
 
     const after = await this.client.getChannel(channelId);
     return { channel: after, update, settlement };
+  }
+
+  // ── Custodial invoice rail — RECEIVE (INVOICE_RAIL_SPEC.md) ──
+  //
+  // These are LSP invoices: bare hub-side records, settled custodially by the
+  // LSP (payer channel debited, payee channel credited atomically; the payee's
+  // hosted capacity GROWS with the credit). NOT the PQ-signed bech32m invoice
+  // from invoice.ts — that format is the trust-minimized Opt3 target, and these
+  // methods keep their shape when it lands.
+
+  /** Parse a `soqln:` invoice URI to its invoice id, or null if malformed.
+   *  Accepts the v1 bare form `soqln:<64-hex-id>` and the forward-compatible
+   *  `soqln:<host>/<64-hex-id>` (host ignored — single-LSP v1). */
+  static parseInvoiceUri(input: string): string | null {
+    let s = input.trim();
+    if (!/^soqln:/i.test(s)) return null;
+    s = s.slice(6);
+    const slash = s.lastIndexOf("/");
+    if (slash >= 0) s = s.slice(slash + 1);
+    s = s.toLowerCase();
+    return /^[0-9a-f]{64}$/.test(s) ? s : null;
+  }
+
+  /** Create a pending invoice for `amountSat` on your hosted channel. Share the
+   *  returned `uri` (QR / paste) with the payer; poll with `awaitInvoicePaid`. */
+  async createInvoice(channelId: string, amountSat: number, opts?: { memo?: string; expirySeconds?: number }): Promise<LspInvoice> {
+    if (amountSat <= 0) throw new Error("amount must be positive");
+    return this.client.createInvoice({
+      channel_id: channelId, amount_sat: amountSat,
+      memo: opts?.memo ?? "", expiry_seconds: opts?.expirySeconds ?? 0,
+    });
+  }
+
+  /** Fetch an invoice's current status. */
+  invoice(invoiceId: string): Promise<LspInvoice> { return this.client.getInvoice(invoiceId); }
+
+  /** Pay an invoice from `channelId`: builds the eLTOO state update moving
+   *  exactly the invoice amount initiator→peer (same construction as pay())
+   *  and settles it through the invoice endpoint, so the LSP atomically
+   *  credits the payee. Returns the committed payer channel + paid invoice. */
+  async payInvoice(invoiceId: string, channelId: string): Promise<{ channel: Channel; invoice: LspInvoice }> {
+    const inv = await this.client.getInvoice(invoiceId);
+    if (inv.status !== "pending") throw new Error(`invoice is ${inv.status}`);
+
+    const ch = await this.client.getChannel(channelId);
+    if (ch.state !== "open") throw new Error(`channel not open (state=${ch.state})`);
+    if (inv.amount_sat > ch.initiator_balance_sat) throw new Error("insufficient initiator balance");
+
+    const next: UpdateContext = {
+      channel: ch,
+      nextStateIndex: ch.state_index + 1,
+      nextInitiatorBalanceSat: ch.initiator_balance_sat - inv.amount_sat,
+      nextPeerBalanceSat: ch.peer_balance_sat + inv.amount_sat,
+    };
+    const tx = await this.builder.build(next);
+    const resp = await this.client.payInvoice(invoiceId, {
+      channel_id: channelId,
+      state_index: next.nextStateIndex,
+      initiator_balance_sat: next.nextInitiatorBalanceSat,
+      peer_balance_sat: next.nextPeerBalanceSat,
+      ...tx,
+    });
+    if (!resp.accepted) throw new Error(`invoice pay rejected: ${resp.reject_reason ?? "unknown"}`);
+
+    const after = await this.client.getChannel(channelId);
+    if (after.state_index <= ch.state_index)
+      throw new Error(`state did not advance: ${ch.state_index} -> ${after.state_index}`);
+    if (after.initiator_balance_sat + after.peer_balance_sat !== after.capacity_sat)
+      throw new Error("balance not conserved after invoice pay");
+    return { channel: after, invoice: resp.invoice ?? inv };
+  }
+
+  /** Poll an invoice until it leaves `pending` (paid or expired) or `timeoutMs`
+   *  elapses. Returns the last-seen invoice — check `status === "paid"`. */
+  async awaitInvoicePaid(invoiceId: string, opts?: { intervalMs?: number; timeoutMs?: number }): Promise<LspInvoice> {
+    const interval = opts?.intervalMs ?? 2000;
+    const deadline = Date.now() + (opts?.timeoutMs ?? 600000);
+    let inv = await this.client.getInvoice(invoiceId);
+    while (inv.status === "pending" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, interval));
+      inv = await this.client.getInvoice(invoiceId);
+    }
+    return inv;
   }
 
   /** Cooperative close → L1 settlement enqueued via the LSP.

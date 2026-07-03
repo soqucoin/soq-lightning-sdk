@@ -77,6 +77,47 @@ export interface CloseResp {            // rest.go cooperativeClose
   settlement_txid?: string;             // present when L1 settlement enqueued
 }
 
+// ---- LSP invoices (custodial receive rail — INVOICE_RAIL_SPEC.md) ----
+// NOT the PQ-signed bech32m invoice from invoice.ts: LSP invoices are bare hub-side
+// records settled custodially (payer channel debited, payee channel credited
+// atomically by the LSP). The signed-invoice format remains the trust-minimized
+// Opt3 target; these endpoints keep their shape when that rail lands.
+export interface CreateInvoiceReq {
+  channel_id: string;                   // payee channel (must be LSP-hosted + open)
+  amount_sat: number;
+  memo?: string;                        // ≤140 chars
+  expiry_seconds?: number;              // default 3600, clamp [60, 86400]
+}
+export interface LspInvoice {           // rest_invoice.go invoiceToMap
+  invoice_id: string;
+  uri: string;                          // soqln:<invoice_id>
+  channel_id: string;
+  amount_sat: number;
+  memo: string;
+  status: "pending" | "paid" | "expired";
+  created_at: string;                   // RFC3339
+  expires_at: string;                   // RFC3339
+  paid_at?: string;
+  payer_channel_id?: string;
+}
+export interface PayInvoiceReq {        // updateState fields + the payer channel
+  channel_id: string;                   // payer channel (URL identifies the INVOICE)
+  state_index: number;
+  initiator_balance_sat: number;        // must move EXACTLY amount_sat initiator→peer
+  peer_balance_sat: number;
+  update_tx_hex: string;
+  settlement_tx_hex: string;
+  ctv_hash: string;
+}
+export interface PayInvoiceResp {
+  accepted: boolean;
+  reject_reason?: string;
+  peer_signature_hex?: string;
+  settlement_signature_hex?: string;
+  payee_credited?: boolean;
+  invoice?: LspInvoice;                 // the paid invoice (on success)
+}
+
 // ---- watchtower status proxy (LSP exposes tower health to spokes; towers themselves
 // are firewalled internal-only — see README topology note) ----
 export interface TowerProxyEntry {     // one entry per armed tower (dual-tower fan-out)
@@ -137,6 +178,13 @@ export class LspClient {
   }
   closeChannel(id: string) {
     return this.req<CloseResp>("POST", `/v1/channels/${id}/close`);
+  }
+
+  // Custodial invoice rail (INVOICE_RAIL_SPEC.md).
+  createInvoice(req: CreateInvoiceReq) { return this.req<LspInvoice>("POST", "/v1/invoices", req); }
+  getInvoice(id: string) { return this.req<LspInvoice>("GET", `/v1/invoices/${id}`); }
+  payInvoice(id: string, req: PayInvoiceReq) {
+    return this.req<PayInvoiceResp>("POST", `/v1/invoices/${id}/pay`, req);
   }
 
   dashboard() { return this.req<any>("GET", "/v1/dashboard"); }

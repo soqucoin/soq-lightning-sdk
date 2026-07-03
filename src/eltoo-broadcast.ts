@@ -83,11 +83,15 @@ export class EltooBroadcaster {
 
   // ---- unsigned tx builders (deterministic) ----
 
-  /** Tu,0 — spend the funding 2-of-2 to a fresh eLTOO(stateNum) output. value = capacity − fee. */
+  /** Tu,0 — spend the funding 2-of-2 to a fresh eLTOO(stateNum) output. value = capacity − fee.
+   *  nLockTime carries the state number (spec §B.3: `stateNum+1`). The funding output has no CLTV
+   *  so consensus ignores it (sequence is final), but the eLTOO convention + the LSP's policy
+   *  (manager.go Task 7) require `locktime == stateNum+1` — the canary's locktime-0 shortcut is
+   *  consensus-valid but the LSP rejects it. */
   buildFundingUpdateTx(stateNum: number): Tx {
     return {
       version: 2,
-      locktime: 0, // funding has no CLTV; locktime unconstrained
+      locktime: stateNum + 1,
       vin: [{ prevout: this.p.funding, sequence: 0xffffffff }],
       vout: [{ value: this.p.capacitySat - this.p.feeSat, scriptPubKey: p2wshV6(this.eltooScript(stateNum)) }],
     };
@@ -122,6 +126,22 @@ export class EltooBroadcaster {
         { value: a.initiatorBalanceSat, scriptPubKey: this.p.initiatorScriptPubKey },
         { value: a.peerBalanceSat, scriptPubKey: this.p.peerScriptPubKey },
       ],
+    };
+  }
+
+  /** Ts,0 — the state-0 full-refund settlement (self-funded open, spec §3.2). The channel opens
+   *  with ALL funds on the initiator side, so the settlement spends the state-0 update output via
+   *  the ELSE/CSV branch to a SINGLE output (initiator payout = updateValue − fee). NOT
+   *  buildSettlementTx with a zero peer balance: the LSP REJECTS a 2-output state-0 settlement
+   *  (manager rule 7 — exactly one output), and peerScriptPubKey isn't known at open time. */
+  buildRefundSettlementTx(a: { updateOutpoint: OutPoint; updateValueSat: bigint }): Tx {
+    const refund = a.updateValueSat - this.p.feeSat;
+    if (refund <= 0n) throw new Error(`refund settlement: updateValue ${a.updateValueSat} ≤ fee ${this.p.feeSat}`);
+    return {
+      version: 2,
+      locktime: 0,
+      vin: [{ prevout: a.updateOutpoint, sequence: this.p.settlementCsv }],
+      vout: [{ value: refund, scriptPubKey: this.p.initiatorScriptPubKey }],
     };
   }
 

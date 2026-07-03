@@ -16,7 +16,7 @@ import {
   EltooBroadcaster, type ChannelParams, type SignedTx,
 } from "./eltoo-broadcast.js";
 import {
-  SIGHASH_ANYPREVOUTANYSCRIPT, txid, toHex, fromHex, serializeTx, ctvHash,
+  SIGHASH_ANYPREVOUTANYSCRIPT, txid, toHex, fromHex, serializeTx, ctvHash, keyhashFunding2of2,
   type Tx, type OutPoint, type KeyhashPartial,
 } from "./channel.js";
 import type { MlDsa } from "./invoice.js";
@@ -241,4 +241,103 @@ export async function lspUpdateRound(
     userUpdate, userSettle,
     lspPub: a.lspPub, lspUpdateSigHex: resp.peer_signature_hex, lspSettleSigHex: resp.settlement_signature_hex,
   });
+}
+
+// ====================================================================
+// Gate 2 — self-custodial channel OPEN round (self-funded 2-of-2)
+// ====================================================================
+
+/** The self-funded-open round-trip the user performs against the LSP
+ *  (POST /v1/channels/self-funded). Injectable so the round is testable with a mock LSP. */
+export interface SelfFundedOpenDeps {
+  openSelfFunded(req: {
+    initiator_pub_key_hex: string; capacity_sat: number; csv_delay: number; initiator_address: string;
+    funding_txid: string; funding_vout: number;
+    update_tx_hex: string; settlement_tx_hex: string; ctv_hash: string;
+  }): Promise<{
+    accepted: boolean; reject_reason?: string; channel_id?: string;
+    peer_pub_key_hex?: string; peer_address?: string;
+    peer_signature_hex?: string; settlement_signature_hex?: string;
+    funding_script_pub_key_hex?: string; state?: string;
+  }>;
+}
+
+/** The fully-signed product of a self-funded open: the channel id + the broadcastable state-0
+ *  (Tu, Ts) the user persists, so it can unilaterally exit (broadcast update, then after the CSV
+ *  the refund settlement) with NO further LSP contact — the point of self-custody. */
+export interface SelfFundedOpenResult {
+  channelId: string;
+  update: SignedTx;      // state-0 Tu (funding 2-of-2 → eLTOO(0))
+  settlement: SignedTx;  // state-0 Ts (full refund to the initiator)
+  peerPubKeyHex: string;
+  peerAddress?: string;
+  fundingScriptPubKeyHex: string;
+}
+
+/** Gate 2: the self-custodial channel-OPEN round (spec §3.2) — the mirror of `lspUpdateRound` for
+ *  state 0, where the channel is funded by a USER-CONTROLLED 2-of-2. The user builds the state-0
+ *  update + a SINGLE-output full-refund settlement against `bc`'s funding outpoint, signs its own
+ *  partials, POSTs them, and the LSP returns its two partials; this stitches them into the
+ *  fully-signed (Tu, Ts) the user persists. Throws if the LSP rejects, omits a partial, or would
+ *  fund a DIFFERENT 2-of-2 than the user (a wrong/stale `lspPub` — caught BEFORE any broadcast).
+ *
+ *  `bc` MUST be built with initiatorPub = userPub, peerPub = lspPub, and funding = the (display→
+ *  internal) txid:vout of the funding output, capacitySat = the funding output value. */
+export async function selfFundedOpenRound(
+  bc: EltooBroadcaster, deps: SelfFundedOpenDeps,
+  a: {
+    fundingTxidDisplay: string; fundingVout: number; csvDelay: number;
+    initiatorPubKeyHex: string; initiatorAddress: string;
+    userSecretKey: Uint8Array; userPub: Uint8Array; lspPub: Uint8Array; mldsa: MlDsa;
+  },
+): Promise<SelfFundedOpenResult> {
+  if (a.fundingTxidDisplay.length !== 64)
+    throw new Error(`fundingTxidDisplay must be a 64-char display-order txid, got ${a.fundingTxidDisplay.length}`);
+
+  // State 0: funding 2-of-2 → update (locktime 1) → single-output full-refund settlement.
+  const updateTx = bc.buildFundingUpdateTx(0);
+  const updateValueSat = updateTx.vout[0].value;
+  const settlementTx = bc.buildRefundSettlementTx({ updateOutpoint: { txid: txid(updateTx), n: 0 }, updateValueSat });
+
+  // The user signs ITS partials before handing the txs to the LSP. The update spends the funding
+  // 2-of-2 (0x42 amount = capacity); the settlement spends the update output (amount = updateValue).
+  const userUpdate = bc.signFundingPartial(updateTx, a.userSecretKey, a.userPub, a.mldsa);
+  const userSettle = bc.signEltooPartial(settlementTx, updateValueSat, a.userSecretKey, a.userPub, a.mldsa);
+
+  const resp = await deps.openSelfFunded({
+    initiator_pub_key_hex: a.initiatorPubKeyHex,
+    capacity_sat: Number(bc.p.capacitySat),
+    csv_delay: a.csvDelay,
+    initiator_address: a.initiatorAddress,
+    funding_txid: a.fundingTxidDisplay,
+    funding_vout: a.fundingVout,
+    update_tx_hex: toHex(serializeTx(updateTx)),
+    settlement_tx_hex: toHex(serializeTx(settlementTx)),
+    ctv_hash: toHex(ctvHash(settlementTx, 0)),
+  });
+  if (!resp.accepted) throw new Error(`LSP rejected self-funded open: ${resp.reject_reason ?? "unknown"}`);
+  if (!resp.channel_id) throw new Error("LSP accepted the self-funded open but returned no channel_id");
+  if (!resp.peer_signature_hex || !resp.settlement_signature_hex)
+    throw new Error(
+      "LSP did not return BOTH partials (peer_signature_hex / settlement_signature_hex) — the user " +
+      "cannot self-custodially exit without them (self-funded co-sign not deployed?).");
+
+  // Safety gate BEFORE any broadcast: the LSP recomputed the 2-of-2 from its OWN peer key. If it
+  // differs from the one the user funds, the funding output is unspendable.
+  const localSpk = toHex(keyhashFunding2of2(a.userPub, a.lspPub).scriptPubKey);
+  if (resp.funding_script_pub_key_hex && resp.funding_script_pub_key_hex.toLowerCase() !== localSpk.toLowerCase())
+    throw new Error(
+      "funding scriptPubKey mismatch: the LSP would fund a different 2-of-2 than the user " +
+      "(is lspPub the LSP's current peer key?). Do NOT broadcast the funding tx.");
+
+  const update = bc.assembleFundingSpend(updateTx, [userUpdate, lspPartial(a.lspPub, resp.peer_signature_hex)]);
+  const settlement = bc.assembleSettlement(settlementTx, 0, [userSettle, lspPartial(a.lspPub, resp.settlement_signature_hex)]);
+
+  return {
+    channelId: resp.channel_id,
+    update, settlement,
+    peerPubKeyHex: resp.peer_pub_key_hex ?? toHex(a.lspPub),
+    peerAddress: resp.peer_address,
+    fundingScriptPubKeyHex: resp.funding_script_pub_key_hex ?? localSpk,
+  };
 }

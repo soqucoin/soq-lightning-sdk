@@ -43,6 +43,30 @@ console.log(await ln.channel(ch.channel_id)); // balances shifted, state_index b
 await ln.close(ch.channel_id);                // cooperative close, L1 settlement
 ```
 
+## Getting paid (LSP invoices)
+
+Accept a Lightning payment in a few lines — create an invoice on your channel,
+show the `soqln:` URI (QR or paste), and wait for it to settle:
+
+```ts
+// payee: request 0.25 SOQ
+const inv = await ln.createInvoice(myChannel.channel_id, 2500_0000, { memo: "coffee" });
+console.log(inv.uri);                          // soqln:<id> — show as QR / send to the payer
+
+const settled = await ln.awaitInvoicePaid(inv.invoice_id);
+if (settled.status === "paid") console.log("paid — channel balance grew");
+
+// payer: settle a soqln: URI
+const id = SoqLightning.parseInvoiceUri(scannedUri)!;
+await ln.payInvoice(id, payerChannel.channel_id);
+```
+
+Settlement is **custodial** on the hosted beta: the LSP hub atomically debits the
+payer's channel and credits yours (your hosted capacity grows with the credit —
+every credited sat is backed by the payer's debit). These are *LSP invoices*, not
+the PQ-signed `soq1ln1…` invoices below — the signed format is the trust-minimized
+target, and this API keeps its shape when that rail lands.
+
 ## In the browser (zero install)
 
 This SDK is pure TypeScript and the ML-DSA-44 binding (`@noble/post-quantum`) is WASM-free pure JS, so the **entire crypto path runs client-side in the browser** — generate a Dilithium wallet, build and sign an invoice or transaction, all without a server ever touching a key. This is what powers the [Soqucoin builders playground](https://soqu.org/build): a quantum-safe wallet and a real signed transaction, in the browser, in about a minute.

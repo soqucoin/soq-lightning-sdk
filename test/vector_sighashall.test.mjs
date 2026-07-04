@@ -1,6 +1,6 @@
 // SIGHASH_ALL node-vector proof — closes the gap on channel.ts `sighashAll()` (the standard
 // BIP143 path used by HTLC claims) + bonus byte-equality on htlc.ts `htlcScript()`.
-// PASTE Buddy's `sighashall_dump_vectors` output into V, then: npm test
+// PASTE the node's `sighashall_dump_vectors` output into V, then: npm test
 // Until V.digest_sighash_all is filled (not "PASTE_"), these tests SKIP.
 import { test } from "node:test";
 import assert from "node:assert/strict";

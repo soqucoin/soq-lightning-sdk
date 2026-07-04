@@ -55,7 +55,7 @@ test("envelope: parse cross-checks the JSON's structured fields", () => {
   assert.equal(toHex(t.vin[0].prevout.txid), J.input.prevout_hash);
   assert.equal(t.vout[0].value, BigInt(J.output.value_sat));
   assert.equal(toHex(t.vout[0].scriptPubKey), J.output.scriptPubKey);
-  // Buddy's JSON encodes witness_item_sizes as a string ("[2421, ...]"), so normalize.
+  // The node JSON encodes witness_item_sizes as a string ("[2421, ...]"), so normalize.
   const expectSizes = typeof J.input.witness_item_sizes === "string"
     ? JSON.parse(J.input.witness_item_sizes) : J.input.witness_item_sizes;
   assert.deepEqual(t.witnesses[0].map((x) => x.length), expectSizes);

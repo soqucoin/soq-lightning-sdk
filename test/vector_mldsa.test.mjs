@@ -3,12 +3,12 @@
 //
 // Direction 1 (runs HERE): given a NODE-produced (pubkey, 32-byte digest, signature),
 //   nobleMlDsa.verify(...) must ACCEPT it → noble's verifier agrees with the node's signer.
-// Direction 2 (Buddy runs on the node): take a noble-produced (pubkey, digest, signature)
+// Direction 2 (Run on the node): take a noble-produced (pubkey, digest, signature)
 //   and confirm the node's CPubKey::Verify accepts it. Both directions must pass.
 //
 // PASTE a node tuple into V, then: npm test. Skipped until filled.
 //
-// How Buddy dumps direction-1 (in lightning_script_tests.cpp, like the sighash vectors):
+// How to dump direction-1 (in lightning_script_tests.cpp, like the sighash vectors):
 //   CKey k; k.MakeNewKey(true);
 //   uint256 digest = uint256S("…32 bytes…");           // any fixed 32-byte value
 //   std::vector<unsigned char> sig; k.Sign(digest, sig); // node signs the raw digest

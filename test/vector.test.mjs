@@ -1,5 +1,5 @@
 // B1 node-vector proof — closes the gap between "matches the documented algorithm" and
-// "matches the node". PASTE Buddy's `b1_dump_vectors` output into V below, then:
+// "matches the node". PASTE the node's `b1_dump_vectors` output into V below, then:
 //   npm test
 // Until V.digest_apo_0x42 is filled (not the "PASTE_" sentinel), these tests SKIP.
 import { test } from "node:test";

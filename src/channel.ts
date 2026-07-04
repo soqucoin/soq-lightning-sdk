@@ -12,7 +12,7 @@
 //
 // ⚠️ Cross-checked against the C++ ALGORITHM (interpreter.cpp:1031-1129, 1725-1850)
 // and the test reference (lightning_script_tests.cpp:51-74). Byte-equality vs a LIVE
-// node sighash is PENDING Buddy's dumped vector — see verifyAgainstNodeVector().
+// node sighash is PENDING node-dumped vector — see verifyAgainstNodeVector().
 
 import { sha256 } from "@noble/hashes/sha256";
 import type { MlDsa } from "./invoice.js";
@@ -182,7 +182,7 @@ export function csfs2of2Witness(
   return p2wshV6Witness([sigA, sighash32, pkA, sigB, sighash32, pkB], authScript, trailingPubKey);
 }
 
-// ---- CSFS + CTV: the BINDING V6 spend (provisional, pending Buddy's CSFS+CTV lifecycle test) ----
+// ---- CSFS + CTV: the BINDING V6 spend (provisional, pending CSFS+CTV lifecycle test) ----
 
 /** The BINDING V6 2-of-2 spend script: `OP_NOP5 OP_NOP5 <ctv_hash> OP_NOP4`.
  *  CSFS×2 authorize (each consumes {sig, msg, pubkey} in VERIFY mode), then `<ctv_hash> OP_CTV`
@@ -190,7 +190,7 @@ export function csfs2of2Witness(
  *  on the stack as the clean-stack truthy element (interpreter.cpp:607 — no OP_1 needed).
  *  Closes the CSFS authorize-but-don't-bind gap: CTV constrains the outputs, CSFS authorizes.
  *  CTV omits prevouts, so APO input-rebinding is preserved. msg convention = the ctv_hash
- *  (both parties authorize the exact template). ⚠️ PROVISIONAL until Buddy's on-chain test
+ *  (both parties authorize the exact template). ⚠️ PROVISIONAL until on-chain test
  *  confirms ordering/msg-convention through VerifyScript. */
 export function csfs2of2WithCtvScript(ctvHashValue: Uint8Array): Uint8Array {
   if (ctvHashValue.length !== 32) throw new Error("ctvHash must be 32 bytes");
@@ -707,7 +707,7 @@ export class DilithiumEltooBuilder implements UpdateTxBuilder {
   }
 }
 
-/** Hook for Buddy's known-good vector: feed a (scriptCode, tx, nIn, hashType, amount) the
+/** Hook for known-good vector: feed a (scriptCode, tx, nIn, hashType, amount) the
  *  node computed a sighash for, plus that 32-byte digest, and assert byte-equality. This is
  *  the proof that closes the gap between "matches the documented algorithm" and "matches the
  *  node". Until this passes against a real vector, do NOT broadcast SDK-built txs to mainnet. */

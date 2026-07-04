@@ -7,7 +7,7 @@
 // proves the real trust boundary: the user and the LSP each hold ONLY their own key, each
 // produces a partial in isolation, and the orchestrator combines them into a broadcastable
 // tx — across the full lifecycle (open → supersede → settle → coop close). Offline (no node);
-// the live broadcast is src/two-party-canary.ts (Buddy runs it with creds).
+// the live broadcast is src/two-party-canary.ts (runs with live creds).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -107,7 +107,7 @@ test("updateRound co-signs BOTH txs — user can close without the LSP (F1 fix)"
   assert.equal(settlement.tx.vout[0].value, init);
   assert.equal(settlement.tx.vout[1].value, peer);
 
-  // F1 regression guard: WITHOUT the LSP's settlement partial (the bug Buddy's WS2b had —
+  // F1 regression guard: WITHOUT the LSP's settlement partial (the WS2b bug —
   // it co-signed only the update), the settlement cannot be assembled from the user's
   // partial alone → the user could not unilaterally close. That is exactly what F1 fixes.
   const settlementTx = bc.buildSettlementTx({ updateOutpoint: { txid: update.txid, n: 0 }, updateValueSat: uValue, initiatorBalanceSat: init, peerBalanceSat: peer });

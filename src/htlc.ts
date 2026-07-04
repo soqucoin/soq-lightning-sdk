@@ -12,7 +12,7 @@
 //
 // STATUS: this is the client-side construction + validation layer. The deployed LSP has
 // NO forwarding endpoints yet (rest.go is single-hop accept-and-store), so live multi-hop
-// needs the Go-side update_add_htlc/update_fulfill_htlc wire (Buddy). Everything here is
+// needs the Go-side update_add_htlc/update_fulfill_htlc wire (node-side). Everything here is
 // pure + offline-tested and ready to wire when those land.
 
 import {

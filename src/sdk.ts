@@ -236,13 +236,13 @@ export class SoqLightning {
     return { channel: after, update, settlement };
   }
 
-  // ── Custodial invoice rail — RECEIVE (INVOICE_RAIL_SPEC.md) ──
+  // ── LSP invoice rail, RECEIVE (INVOICE_RAIL_SPEC.md) ──
   //
-  // These are LSP invoices: bare hub-side records, settled custodially by the
-  // LSP (payer channel debited, payee channel credited atomically; the payee's
-  // hosted capacity GROWS with the credit). NOT the PQ-signed bech32m invoice
-  // from invoice.ts — that format is the trust-minimized Opt3 target, and these
-  // methods keep their shape when it lands.
+  // These are LSP invoices: bare hub-side records settled by the LSP acting as
+  // channel counterparty on the public test network (the payee's channel balance
+  // grows on settlement). NOT the PQ-signed bech32m invoice from invoice.ts;
+  // that format is the trust-minimized Opt3 target, and these methods keep their
+  // shape when it lands.
 
   /** Parse a `soqln:` invoice URI to its invoice id, or null if malformed.
    *  Accepts the v1 bare form `soqln:<64-hex-id>` and the forward-compatible

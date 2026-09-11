@@ -61,10 +61,10 @@ const id = SoqLightning.parseInvoiceUri(scannedUri)!;
 await ln.payInvoice(id, payerChannel.channel_id);
 ```
 
-Settlement is **custodial** on the hosted beta: the LSP hub atomically debits the
-payer's channel and credits yours (your hosted capacity grows with the credit —
-every credited sat is backed by the payer's debit). These are *LSP invoices*, not
-the PQ-signed `soq1ln1…` invoices below — the signed format is the trust-minimized
+Settlement on the public test network runs through a Lightning service provider
+that acts as channel counterparty. Test coins only. The self-custodial channel
+mode with unilateral exit is the release design. These are *LSP invoices*, not
+the PQ-signed `soq1ln1…` invoices below; the signed format is the trust-minimized
 target, and this API keeps its shape when that rail lands.
 
 ## In the browser (zero install)

@@ -77,10 +77,10 @@ export interface CloseResp {            // rest.go cooperativeClose
   settlement_txid?: string;             // present when L1 settlement enqueued
 }
 
-// ---- LSP invoices (custodial receive rail — INVOICE_RAIL_SPEC.md) ----
+// ---- LSP invoices (test-network receive rail, INVOICE_RAIL_SPEC.md) ----
 // NOT the PQ-signed bech32m invoice from invoice.ts: LSP invoices are bare hub-side
-// records settled custodially (payer channel debited, payee channel credited
-// atomically by the LSP). The signed-invoice format remains the trust-minimized
+// records settled by the LSP acting as channel counterparty (the payee's channel
+// balance grows on settlement). The signed-invoice format remains the trust-minimized
 // Opt3 target; these endpoints keep their shape when that rail lands.
 export interface CreateInvoiceReq {
   channel_id: string;                   // payee channel (must be LSP-hosted + open)
@@ -180,7 +180,7 @@ export class LspClient {
     return this.req<CloseResp>("POST", `/v1/channels/${id}/close`);
   }
 
-  // Custodial invoice rail (INVOICE_RAIL_SPEC.md).
+  // LSP invoice rail (INVOICE_RAIL_SPEC.md).
   createInvoice(req: CreateInvoiceReq) { return this.req<LspInvoice>("POST", "/v1/invoices", req); }
   getInvoice(id: string) { return this.req<LspInvoice>("GET", `/v1/invoices/${id}`); }
   payInvoice(id: string, req: PayInvoiceReq) {

@@ -1,4 +1,4 @@
-// Custodial invoice rail — SDK facade against a mock LSP mirroring
+// LSP invoice rail, SDK facade against a mock LSP mirroring
 // rest_invoice.go semantics: hub-hop settlement, payee credit = capacity
 // growth (credits are debit-backed, so capacity may exceed the open cap),
 // exact-amount delta enforcement, idempotent double-pay rejection.
